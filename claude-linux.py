@@ -545,32 +545,51 @@ def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]
         data,
         rb'let (' + _IDENT + rb')=(' + _IDENT + rb')\(' + _IDENT
         + rb'\);if\(\1!==null&&\1<(' + _IDENT + rb')\)\{',
-        "rate-limit threshold guard",
+        "rate-limit threshold guard", warn_on_zero=False,
     )
     fallback = find_unique(
         data,
         rb'\}let ' + _IDENT + rb'=Math\.max\((' + _IDENT + rb')\?\?(' + _IDENT
         + rb'),(' + _IDENT + rb')\)',
-        "rate-limit fallback/minimum",
+        "rate-limit fallback/minimum", warn_on_zero=False,
     )
     if guard is None or fallback is None:
-        return []
-    if guard.group(1) != fallback.group(1):
-        print("  WARN: rate-limit guard and fallback refer to different "
-              "variables; refusing to guess", file=sys.stderr)
-        return []
-    if ms_parser_name is not None and guard.group(2) != ms_parser_name:
-        print(f"  WARN: rate-limit guard reads {guard.group(2).decode()}, not the "
-              f"Retry-After parser {ms_parser_name.decode()}; refusing to guess",
-              file=sys.stderr)
-        return []
+        # Claude 2.1.276 folds the same path into one retry loop:
+        #   let ms = retryAfterMs(err), retry = ms !== null && ms < threshold;
+        #   ... if (!retry) { let wait = Math.max(ms ?? fallback, minimum), ... }
+        # Keep the parser name as the semantic anchor; minified identifiers and
+        # the three constants are read from this unique code shape.
+        if ms_parser_name is None:
+            return []
+        modern = find_unique(
+            data,
+            rb'let (' + _IDENT + rb')=' + re.escape(ms_parser_name)
+            + rb'\((' + _IDENT + rb')\),(' + _IDENT + rb')=\1!==null&&\1<('
+            + _IDENT + rb');[\s\S]{0,600}?if\(!\3\)\{let (' + _IDENT
+            + rb')=Math\.max\(\1\?\?(' + _IDENT + rb'),(' + _IDENT + rb')\)',
+            "rate-limit retry path (new shape)",
+        )
+        if modern is None:
+            return []
+        variables = (modern.group(4), modern.group(6), modern.group(7))
+    else:
+        if guard.group(1) != fallback.group(1):
+            print("  WARN: rate-limit guard and fallback refer to different "
+                  "variables; refusing to guess", file=sys.stderr)
+            return []
+        if ms_parser_name is not None and guard.group(2) != ms_parser_name:
+            print(f"  WARN: rate-limit guard reads {guard.group(2).decode()}, not the "
+                  f"Retry-After parser {ms_parser_name.decode()}; refusing to guess",
+                  file=sys.stderr)
+            return []
+        variables = (guard.group(3), fallback.group(2), fallback.group(3))
 
     wanted = [
-        ("rl_threshold", guard.group(3), RATE_LIMIT_THRESHOLD_MS,
+        ("rl_threshold", variables[0], RATE_LIMIT_THRESHOLD_MS,
          "Rate-limit inline-sleep threshold"),
-        ("rl_fallback", fallback.group(2), TARGET_DELAY_MS,
+        ("rl_fallback", variables[1], TARGET_DELAY_MS,
          "Rate-limit fallback wait"),
-        ("rl_min", fallback.group(3), TARGET_DELAY_MS,
+        ("rl_min", variables[2], TARGET_DELAY_MS,
          "Rate-limit minimum wait"),
     ]
     sites = []

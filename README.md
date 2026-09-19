@@ -211,7 +211,7 @@ claude 的补丁本体是二进制里内嵌的压缩 JS 文本。**压缩器生�
 | 2 | 一个 `Math.min(BASE*Math.pow(2,X-1), CAP)`，其中 ①`X` 是所在 `function` 的**第一个形参** ②紧随其后有 `Math.random()` 抖动项。二进制里另有 9 处 `Math.pow(2,n-1)` 退避（MCP 重连、OAuth 刷新、会话持久化…），全部被排除 | 函数名 `rle`、base 值 500 |
 | 3 | `calculateDefaultRetryTimeoutMillis` — SDK 由 TS 源码打包，类方法名是**真实 API 名**不被压缩，是稳定锚点 | 字面量 `0.5*Math.pow(2,` |
 | 4 | 头名 `retry-after` / `retry-after-ms` / `anthropic-ratelimit-unified-reset` 是**协议字符串**，不是压缩名；解析器骨架用回溯引用绑定同一个变量 | `xt` / `$t` / `rR` / `!s` 等压缩标识符 |
-| 5 | 阈值守卫与兜底 `Math.max` **必须引用同一个变量**，且读取函数必须是站点 4 认出的那个解析器 | `=1800000` / `=600000` / `=20000` |
+| 5 | 兼容 stable 当前形状及后续 stable 可能采用的折叠重试循环形状；阈值守卫与兜底 `Math.max` **必须引用同一个变量**，且读取函数必须是站点 4 认出的那个解析器 | `=1800000` / `=600000` / `=20000` |
 | 6 | 锚在遥测事件 `G("tengu_api_retry",{attempt:…,delayMs:X,…})` 上——它在自己的载荷里**报出了延迟变量名**，所以改名也跟得住 | 写死 `xt=` |
 | 1 | 无夹取时不是「假设没有」：完整匹配环境变量读取函数体，确认其中没有 `Math.min`/`Math.max` 才放行 | — |
 
@@ -232,9 +232,9 @@ python3 claude-linux.py           --binary /tmp/claude.test   # 2. 打一遍
 python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 3. 应全部报 already patched
 ```
 
-在 **claude-code 2.x（233584424 字节的 linux-x64 ELF）** 上的实测结果：
+在 **Claude Code stable 2.1.267（linux-x64 ELF）** 上的实测结果：
 
-- 15 处站点全部命中，0 跳过；文件大小逐字节不变，diff 只落在 12 段里。
+- 13 处站点全部命中，0 跳过；打补丁后再次 `--dry-run`，13 处均识别为 `already patched`，文件大小不变。
 - 每段改写连同上下文用 `node --check` 校验过语法：取一个在**原始**二进制上也能解析的窗口，同一窗口在补丁后仍解析通过。
 - 补丁后的退避函数单独取出来跑，`attempt` 从 1 到 30、`Retry-After` 从 1s 到 3600s，返回值恒为 1050–1250ms；SDK 退避恒为约 840–880ms。
 - `claude-linux.py` 与 `claude-windows.py` 的探测/汇总代码逐字符相同（29151 字符），对同一输入产出**逐字节相同**的二进制；差异仅在二进制发现、写文件、命令提示。
@@ -249,7 +249,7 @@ python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 3. 应全部报 
 
 ### 版本适配说明
 
-结构判据比字节串耐用，但不是永久有效：上游若重写重试循环本身（而不只是改名或调参），形状就变了。升级 claude 后先跑 `--dry-run`，看 `Patches skipped` 是否为 0；某处跳过时会打印它期望的形状匹配了几处，据此定位。
+当前目标是 Claude Code `stable` channel，不跟随 `latest` / `next`。结构判据比字节串耐用，但不是永久有效：上游若重写重试循环本身（而不只是改名或调参），形状就变了。升级 stable 后先跑 `--dry-run`，看 `Patches skipped` 是否为 0；某处跳过时会打印它期望的形状匹配了几处，据此定位。
 
 ---
 
