@@ -2,9 +2,9 @@
 """
 Patch Codex CLI's retry backoff interval -- Windows build (PE / x86-64).
 
-Verified against codex rust-v0.144.1 (x86_64-pc-windows-msvc). This is the
+Verified against codex 0.159.2 (x86_64-pc-windows-msvc). This is the
 Windows (PE) build of the codex patcher; for the Linux/macOS ELF/Mach-O build
-use codex-linux.py. The two jittered backoffs it targets are:
+use codex-linux.py. The jittered backoffs it targets are:
 
   1. codex-client/src/retry.rs::backoff(base, attempt)  -- generic retry path
        `sleep(backoff(policy.base_delay, attempt+1))`.
@@ -49,10 +49,11 @@ the inlined `unwrap_or(5).min(100)` codegen is byte-identical, so the same tail
 signature locates every inlined copy and we rewrite the cap immediate to
 STREAM_MAX_RETRIES so a large stream_max_retries in config.toml is honored.
 
-Known coverage gap: in the v0.144.1 MSVC build one backoff uses `addsd [0.9]`
-and the other a bare `movsd [0.9]` whose downstream chain the anchors do not
-fully match, so typically only one of the two paths is fixed to 1000ms; the
-other keeps native jittered backoff. Re-check after each codex upgrade.
+On 0.159.2 the image has three such sites, not the two the ELF build has:
+retry.rs::backoff (the one that scales a Duration with `as_millis`, an `imul`
+by 1000) and two util.rs-shaped copies (fixed 200ms base, no such multiply).
+File order is not the label. The `imul` sits ~430 bytes before the from_millis
+tail, outside the jitter window, so the label scan is separate.
 
 Sites 1-2 alone do NOT give a fixed interval, because two other delay sources in
 core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
@@ -66,28 +67,30 @@ core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
          ...  arg setup ...
          call <core::util::backoff>
      NOP-ing the `jne` makes the fixed backoff unconditional. Accepted only when
-     the call provably lands inside a patched site-2 function -- following an
-     indirect `call [rip+GOT]` needs a VA->file-offset map, so this site uses
-     build_pe_maps() is used for every RIP resolution in this script.
+     the call provably lands inside a patched backoff -- following an indirect
+     `call [rip+GOT]` needs a VA->file-offset map, so build_pe_maps() is used
+     for every RIP resolution in this script. On 0.159.2 that is 9 sites
+     (3 into util.rs::backoff, 6 into retry.rs::backoff), not the ELF build's 4:
+     MSVC left more of these calls outlined.
 
   5. The `unbounded_connection_retries` ladder (Stable, default ON): on a
      ConnectionFailed the delay is a separate field that starts at
      `Duration::from_secs(5)` and doubles up to `from_secs(60)`. Those are plain
      whole-second constants, not `from_millis(f64 * jitter)`, so the sites 1-2
-     anchors cannot see them. Rewriting the *load* pins the delay no matter what
-     the ladder stored -- killing the 5s start and the doubling in one edit:
-         mov <secs64>, [<base>+0x10]   ->   mov <secs32>, <whole seconds>
-         mov <nanos32>,[<base>+0x18]   ->   xor <nanos32>, <nanos32>
-     Both forms are exactly 7 bytes, so the stores of that pair into the async
-     state machine stay in place. The absent REX prefix on the matched loads is
-     what guarantees both registers are below r8 and therefore that the
-     replacement fits; if MSVC parked them in r8..r15 the site simply reports as
-     not found instead of being rewritten.
-
-Sites 4 and 5 were derived from the 0.153.4 ELF build and are register-
-parameterized rather than hard-coded, but they have NOT been verified against an
-MSVC image -- run --dry-run first and expect "NOT FOUND" (a skip, never a bad
-write) if MSVC's codegen differs.
+     anchors cannot see them. The value that is slept is loaded and passed to
+     the sleep helper in the Win64 registers the helper actually reads:
+         mov  rdx, [<base>+disp32]      ; Duration.secs
+         mov  r8d, [<base>+disp32+8]    ; Duration.nanos
+         lea  r9,  [rip+<warn static>]
+         lea  rcx, [<sleep out>]
+         call <sleep>
+     disp32 is 0x10b0 in two copies and 0x228 in the third; none of them is the
+     ELF disp8 +0x10/+0x18 pair, which is why a literal port of that pattern
+     reports NOT FOUND. Rewriting the load (14 bytes: `mov edx,secs` + `xor
+     r8d,r8d` + NOPs) pins the sleep. The doubling store later in the function
+     is left alone; the next iteration loads the constant again. The same
+     function's `.min(60s)` clamp is what distinguishes this from every other
+     Duration passed to that helper.
 
 DESIGN RULE -- this patcher only ever changes "how long to wait after a failure
 has already been declared". It must never change what counts as a failure, nor
@@ -151,6 +154,12 @@ JITTER_BOUND_MIN, JITTER_BOUND_MAX = 0.5, 2.0
 # may sit (the inlined base/jitter arithmetic on this build spans ~70 bytes).
 JITTER_SCAN_BACK = 320
 
+# How far back from the from_millis tail to look for retry.rs's `as_millis`
+# (`imul` by 1000). That multiply is not part of the jitter span: on 0.159.2
+# it sits ~430 bytes before the tail, outside JITTER_SCAN_BACK, so the label
+# window is separate and must not loosen site detection.
+AS_MILLIS_SCAN_BACK = 1024
+
 # `mov <reg32>, imm32` opcode base; the low 3 bits select the register.
 MOV_R32_IMM = 0xB8
 
@@ -170,10 +179,21 @@ BACKOFF_FN_WINDOW = 0x600
 SITE4_CALL_WINDOW = 24
 SITE4_JOIN_WINDOW = 32
 
-# Site 5 circuit breaker: 0.153.4 has exactly two copies of the ladder (sampling
-# and remote-compaction). A much larger count means the signature went loose, and
-# site 5 rewrites live instructions, so refuse rather than guess.
+# Site 5 circuit breaker: 0.159.2 has three MSVC copies of the connection-retry
+# sleep (two at field disp 0x10b0, one at 0x228). A much larger count means the
+# signature went loose, and site 5 rewrites live instructions, so refuse rather
+# than guess.
 MAX_CONN_SITES = 4
+
+# Site 5 MSVC shape. The sleep helper takes Duration as (rdx=secs, r8d=nanos)
+# plus a rip-relative warn static in r9. The load is 14 bytes because the field
+# offset does not fit in disp8. Caps below 30s are other `.min()` pairs that
+# happen to sit near an unrelated Duration sleep (traced at 2s/7s/19s).
+SLEEP_LEA_R9 = bytes.fromhex("4c8d0d")  # lea r9, [rip+disp32]
+SLEEP_LOAD_BACK = 0x48
+SLEEP_CALL_AHEAD = 0x18
+SLEEP_LOAD_LEN = 14
+CONN_SLEEP_CAP_MIN = 30
 
 # Site 5: the delay is confirmed by the `.min(MAX_CONNECTION_RETRY_DELAY)` clamp
 # in the same function -- a `cmp r64, imm8` against a whole-second cap. Bounded
@@ -386,8 +406,9 @@ def find_jitter_sites(data: bytes, maps=None) -> list[dict]:
         fingerprint without hardcoding 0.9;
       * a span between the two that is plausibly the jitter/base arithmetic.
 
-    On the 0.153.4 image 110 tails exist and exactly 2 satisfy all three, so the
-    conjunction -- not any single byte pattern -- is what identifies the sites.
+    On the 0.159.2 image 117 tails exist and exactly 3 satisfy all three (the ELF
+    build of 0.159.1 has 2), so the conjunction -- not any single byte pattern --
+    is what identifies the sites.
     Each dict: {anchor, region_start, region_end, reg, current}.
 
     `maps` is the (off2va, va2off) pair used to resolve RIP operands; when None
@@ -572,7 +593,8 @@ def _conn_tail_ok(data: bytes, off: int, secs_reg: int, nanos_reg: int) -> bool:
             and (data[lea + 2] & 0xC7) == 0x05)
 
 
-def _ladder_cap_near(data: bytes, off: int, window: int = LADDER_WINDOW):
+def _ladder_cap_near(data: bytes, off: int, window: int = LADDER_WINDOW,
+                     cap_min: int = LADDER_CAP_MIN):
     """The `min(MAX_CONNECTION_RETRY_DELAY)` cap guarding this delay, or None.
 
     What makes a load *the* connection-retry delay is not its byte encoding but
@@ -594,7 +616,7 @@ def _ladder_cap_near(data: bytes, off: int, window: int = LADDER_WINDOW):
         if data[i] != 0x48 or data[i + 1] != 0x83 or (data[i + 2] & 0xF8) != 0xF8:
             continue
         imm = data[i + 3]
-        if not (LADDER_CAP_MIN < imm <= LADDER_CAP_MAX):
+        if not (cap_min < imm <= LADDER_CAP_MAX):
             continue
         # The companion `cmp r64, imm-1` follows within a few bytes (the setCC
         # that consumes the first compare sits between them).
@@ -636,6 +658,7 @@ def find_conn_delay_sites(data: bytes) -> list[dict]:
                                 "ladder": ladder, "current": None})
         i = data.find(b"\x48\x8b", i + 1)
     out.extend(_find_patched_conn_delay_sites(data))
+    out.extend(_find_sleep_load_sites(data))
     return sorted(out, key=lambda s: s["off"])
 
 
@@ -671,6 +694,233 @@ def make_conn_delay_patch(secs_reg: int, nanos_reg: int, secs: int) -> bytes:
 def conn_delay_secs(ms: int) -> int:
     """Site 5 stores a whole-second Duration, so round RETRY_MS up to >= 1s."""
     return max(1, round(ms / 1000))
+
+
+def _mov_r32_imm_at(data: bytes, off: int):
+    """(reg, imm, length) if `off` is `mov r32, imm32`, else None."""
+    if off < 0 or off >= len(data):
+        return None
+    if data[off] == 0x41 and off + 6 <= len(data) and 0xB8 <= data[off + 1] <= 0xBF:
+        reg = 8 + (data[off + 1] - MOV_R32_IMM)
+        return reg, struct.unpack_from("<I", data, off + 2)[0], 6
+    if off + 5 <= len(data) and 0xB8 <= data[off] <= 0xBF:
+        return data[off] - MOV_R32_IMM, struct.unpack_from("<I", data, off + 1)[0], 5
+    return None
+
+
+def _xor_r32_at(data: bytes, off: int):
+    """(reg, length) if `off` is `xor r32, r32`, else None."""
+    if off + 2 <= len(data) and data[off] == 0x31:
+        modrm = data[off + 1]
+        reg = (modrm >> 3) & 7
+        if modrm == (0xC0 | (reg << 3) | reg):
+            return reg, 2
+    if off + 3 <= len(data) and data[off] == 0x45 and data[off + 1] == 0x31:
+        modrm = data[off + 2]
+        reg = (modrm >> 3) & 7
+        if modrm == (0xC0 | (reg << 3) | reg):
+            return 8 + reg, 3
+    return None
+
+
+def _disp32_load_at(data: bytes, off: int):
+    """A `mov r, [base+disp32]` (no SIB), or None.
+
+    Returns (wide, dest, base, disp). `wide` is REX.W: the secs half of a
+    Duration is a u64, the nanos half a u32."""
+    if off < 0 or off + 7 > len(data):
+        return None
+    rex = data[off]
+    if not (0x40 <= rex <= 0x4F) or data[off + 1] != 0x8B:
+        return None
+    modrm = data[off + 2]
+    if (modrm >> 6) != 0b10 or (modrm & 7) == 0b100:
+        return None
+    disp = struct.unpack_from("<i", data, off + 3)[0]
+    dest = ((modrm >> 3) & 7) | (8 if rex & 0x4 else 0)
+    base = (modrm & 7) | (8 if rex & 0x1 else 0)
+    return bool(rex & 0x8), dest, base, disp
+
+
+def _sleep_load_pair_at(data: bytes, off: int):
+    """The unpatched 14-byte Duration load, or None.
+
+    mov <secs64>, [base+disp32] ; mov <nanos32>, [base+disp32+8]
+    """
+    secs = _disp32_load_at(data, off)
+    nanos = _disp32_load_at(data, off + 7)
+    if secs is None or nanos is None:
+        return None
+    sec_wide, sec_reg, sec_base, sec_disp = secs
+    nano_wide, nano_reg, nano_base, nano_disp = nanos
+    if not (sec_wide and not nano_wide and sec_base == nano_base
+            and nano_disp == sec_disp + 8 and sec_reg != nano_reg):
+        return None
+    return sec_reg, nano_reg, sec_disp
+
+
+def _patched_sleep_load_at(data: bytes, off: int):
+    """The patched 14-byte form: `mov <secs32>,imm ; xor <nanos32>,<nanos32>`,
+    NOP-padded. Returns (secs_reg, nanos_reg, imm) or None."""
+    if off < 0 or off + SLEEP_LOAD_LEN > len(data):
+        return None
+    mov = _mov_r32_imm_at(data, off)
+    if mov is None:
+        return None
+    secs_reg, imm, n = mov
+    p = off + n
+    end = off + SLEEP_LOAD_LEN
+    while p < end and data[p] == 0x90:
+        p += 1
+    xor = _xor_r32_at(data, p) if p < end else None
+    if xor is None:
+        return None
+    nanos_reg, xn = xor
+    p += xn
+    if nanos_reg == secs_reg or any(b != 0x90 for b in data[p:end]):
+        return None
+    return secs_reg, nanos_reg, imm
+
+
+def _step_preserving(data: bytes, off: int, protected: set[int]):
+    """Byte length of a mov/lea at `off` that does not write `protected`, or
+    None. The gap between the Duration load and `call sleep` on this build is
+    only spills and the two setup leas, so anything else is not this site."""
+    if off >= len(data) or data[off] == 0x90:
+        return 1 if off < len(data) and data[off] == 0x90 else None
+    rex = data[off]
+    if not (0x40 <= rex <= 0x4F) or off + 3 > len(data):
+        return None
+    op = data[off + 1]
+    if op not in (0x89, 0x8B, 0x8D):
+        return None
+    modrm = data[off + 2]
+    mod, reg_f, rm = modrm >> 6, (modrm >> 3) & 7, modrm & 7
+    reg = reg_f | (8 if rex & 0x4 else 0)
+    rm_reg = rm | (8 if rex & 0x1 else 0)
+    if mod == 0b11:
+        length = 3
+    elif rm == 4:
+        if off + 4 > len(data):
+            return None
+        sib = data[off + 3]
+        if mod == 0:
+            length = 8 if (sib & 7) == 5 else 4
+        elif mod == 1:
+            length = 5
+        else:
+            length = 8
+    elif mod == 0 and rm == 5:
+        length = 7
+    elif mod == 0:
+        length = 3
+    elif mod == 1:
+        length = 4
+    else:
+        length = 7
+    if off + length > len(data):
+        return None
+    writes = reg if op in (0x8B, 0x8D) or mod == 0b11 else None
+    if writes in protected:
+        return None
+    return length
+
+
+def _call_after_load(data: bytes, load_end: int, lea: int, protected: set[int]):
+    """File offset of the `call` that consumes this load, or None.
+
+    The walk has to pass through `lea` (the `lea r9, [rip+warn]`) and stop at
+    an `e8` without either Duration register being overwritten."""
+    p = load_end
+    limit = min(len(data), lea + SLEEP_CALL_AHEAD)
+    saw_lea = False
+    while p < limit:
+        if p == lea:
+            saw_lea = True
+        if data[p] == 0xE8 and p + 5 <= len(data):
+            return p if saw_lea else None
+        step = _step_preserving(data, p, protected)
+        if step is None:
+            return None
+        p += step
+    return None
+
+
+def _find_sleep_load_sites(data: bytes) -> list[dict]:
+    """MSVC `tokio::time::sleep(connection_retry_delay)` argument loads.
+
+    The ELF finder wants `mov r64,[base+0x10] / mov r32,[base+0x18]`, which this
+    image does not emit. Here the field offset needs disp32 and the sleep helper
+    reads secs from rdx and nanos from r8d, with the warn static in r9:
+
+        mov  rdx, [base+disp32]
+        mov  r8d, [base+disp32+8]
+        lea  r9,  [rip+<warn static>]
+        lea  rcx, [<out>]
+        call <sleep>
+
+    A hit also needs the `.min(MAX_CONNECTION_RETRY_DELAY)` pair in the same
+    function. The floor is 30s so a nearby `.min()` of a few seconds cannot
+    promote some other slept Duration.
+    """
+    out: list[dict] = []
+    seen: set[int] = set()
+    i = data.find(SLEEP_LEA_R9)
+    while i != -1:
+        for back in range(SLEEP_LOAD_LEN, SLEEP_LOAD_BACK + 1):
+            load = i - back
+            pair = _sleep_load_pair_at(data, load)
+            patched = None if pair is not None else _patched_sleep_load_at(data, load)
+            if pair is None and patched is None:
+                continue
+            if pair is not None:
+                secs_reg, nanos_reg, disp = pair
+                current = None
+            else:
+                secs_reg, nanos_reg, current = patched
+                disp = None
+            call = _call_after_load(data, load + SLEEP_LOAD_LEN, i, {secs_reg, nanos_reg})
+            if call is None:
+                continue
+            ladder = _ladder_cap_near(data, load, cap_min=CONN_SLEEP_CAP_MIN)
+            if ladder is None or load in seen:
+                continue
+            seen.add(load)
+            out.append({"off": load, "secs_reg": secs_reg, "nanos_reg": nanos_reg,
+                        "base_reg": None, "disp": disp, "ladder": ladder,
+                        "span": SLEEP_LOAD_LEN, "current": current})
+            break
+        i = data.find(SLEEP_LEA_R9, i + 1)
+    return out
+
+
+def make_sleep_load_patch(secs_reg: int, nanos_reg: int, secs: int,
+                          span: int = SLEEP_LOAD_LEN) -> bytes:
+    """`mov <secs32>, secs ; xor <nanos32>, <nanos32>` padded out to `span`.
+
+    The disp32 load it replaces is 14 bytes, so r8d (the nanos register this
+    build actually uses) fits; the 7-byte ELF form cannot.
+    """
+    if not (0 <= secs_reg < 16 and 0 <= nanos_reg < 16) or secs_reg == nanos_reg:
+        die("site 5 sleep load has no two distinct registers")
+    mov = (_mov_r32_imm_bytes(secs_reg, secs))
+    xor = _xor_r32_bytes(nanos_reg)
+    if len(mov) + len(xor) > span:
+        die(f"site 5 patch ({len(mov) + len(xor)}B) does not fit in {span}B")
+    return mov + xor + b"\x90" * (span - len(mov) - len(xor))
+
+
+def _mov_r32_imm_bytes(reg: int, imm: int) -> bytes:
+    if reg >= 8:
+        return bytes([0x41, MOV_R32_IMM + (reg & 7)]) + struct.pack("<I", imm)
+    return bytes([MOV_R32_IMM + reg]) + struct.pack("<I", imm)
+
+
+def _xor_r32_bytes(reg: int) -> bytes:
+    if reg >= 8:
+        low = reg & 7
+        return bytes([0x45, 0x31, 0xC0 | (low << 3) | low])
+    return bytes([0x31, 0xC0 | (reg << 3) | reg])
 
 
 # ── Site 3 (stream_max_retries cap) ───────────────────────────────────────────
@@ -711,17 +961,63 @@ def current_stream_caps(data: bytes) -> list[int]:
 SITE_LABELS = ("retry.rs::backoff", "util.rs::backoff")
 
 
-def plan(data: bytes, ms: int, off2va=None):
+def _as_millis_before(data: bytes, end: int) -> bool:
+    """True when `Duration::as_millis` (`imul` by 1000) sits before `end`.
+
+    retry.rs::backoff scales a caller-supplied Duration (`secs * 1000 + nanos /
+    1e6`). util.rs::backoff starts from a fixed 200ms and has no such multiply.
+    The multiply can sit well above the jitter span (~430 bytes on 0.159.2).
+    """
+    start = max(0, end - AS_MILLIS_SCAN_BACK)
+    limit = min(end, len(data))
+    i = start
+    while i < limit - 6:
+        op = i + 1 if 0x40 <= data[i] <= 0x4F else i
+        if op + 6 <= limit and data[op] == 0x69:
+            if struct.unpack_from("<i", data, op + 2)[0] == 1000:
+                return True
+        i += 1
+    return False
+
+
+def jitter_label(data: bytes, site: dict) -> str:
+    if _as_millis_before(data, site["region_end"]):
+        return "retry.rs::backoff"
+    return "util.rs::backoff"
+
+
+def _site4_backoff_name(data: bytes, site: dict, jitter_report, off2va, va2off) -> str:
+    """Which patched backoff a site-4 call actually enters, for the dry-run log."""
+    target = _call_target_off(data, site["call"], off2va, va2off)
+    if target is None:
+        return "backoff"
+    best = None
+    for label, js in jitter_report:
+        region = js["region_start"]
+        if target <= region < target + BACKOFF_FN_WINDOW:
+            dist = region - target
+            if best is None or dist < best[0]:
+                best = (dist, label)
+    return best[1] if best else "backoff"
+
+
+def plan(data: bytes, ms: int, maps=None):
     """Return (edits, report). edits: [(off, bytes)]. report: [(label, site)]."""
     edits, report = [], []
-    sites = find_jitter_sites(data, off2va)
-    if len(sites) < 1:
-        die("found no jittered backoff sites (0.9..1.1)")
-    for idx, s in enumerate(sites):
-        label = SITE_LABELS[idx] if idx < len(SITE_LABELS) else f"backoff[{idx}]"
+    sites = find_jitter_sites(data, maps)
+    if len(sites) < len(SITE_LABELS):
+        die(f"expected at least {len(SITE_LABELS)} jittered backoff sites "
+            f"(0.9..1.1), found {len(sites)}")
+    for s in sites:
+        label = jitter_label(data, s)
         patch = make_jitter_patch(s["reg"], s["region_end"] - s["region_start"], ms)
         edits.append((s["region_start"], patch))
         report.append((label, s))
+    missing = [name for name in SITE_LABELS if name not in (lab for lab, _ in report)]
+    if missing:
+        got = ", ".join(lab for lab, _ in report)
+        die(f"expected both {' and '.join(SITE_LABELS)}, got {got}; "
+            f"missing {', '.join(missing)}")
     return edits, report
 
 
@@ -825,9 +1121,6 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     print(f"  {len(tails)} inlined Duration::from_millis tail(s) in the image; "
           f"keeping those with a mulsd + jitter-range bound upstream")
     edits, report = plan(data, ms, maps)
-    if len(report) < len(SITE_LABELS):
-        print(f"  NOTE: matched {len(report)}/{len(SITE_LABELS)} backoff paths "
-              f"(MSVC movsd path may not match on some builds)")
     for idx, (label, s) in enumerate(report, 1):
         span = s["region_end"] - s["region_start"]
         print(f"  [{idx}] {label}")
@@ -865,7 +1158,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
               f"  (Option<Duration> None niche)")
         print(f"        branch  : {s['len']}-byte jne @ 0x{s['jne']:x} -> {state}")
         print(f"        verified: call @ 0x{s['call']:x} lands in a patched "
-              f"util.rs::backoff")
+              f"{_site4_backoff_name(bytes(data), s, report, *maps)}")
         print(f"        rewrite : jne -> {s['len']}-byte NOP "
               f"(server Retry-After ignored, backoff always wins)")
     if not ra_sites:
@@ -892,7 +1185,8 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
               f"secs={reg_name(s['secs_reg'])} nanos={reg_name(s['nanos_reg'])}")
         print(f"        verified: min({cap}s) ladder clamp @ 0x{ladder_off:x}")
         print(f"        current : {cur} -> {secs}s")
-        print(f"        rewrite : 7B -> mov {reg_name(s['secs_reg'])},{secs} ; "
+        span = s.get("span", 7)
+        print(f"        rewrite : {span}B -> mov {reg_name(s['secs_reg'])},{secs} ; "
               f"xor {reg_name(s['nanos_reg'])},{reg_name(s['nanos_reg'])}")
     if not conn_sites:
         print("  NOT FOUND - skipping (set unbounded_connection_retries = false "
@@ -901,8 +1195,11 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
         print(f"  NOTE: site 5 stores whole seconds, so {ms}ms is applied as {secs}s")
     for s in conn_sites:
         if s["current"] != secs:
-            edits.append((s["off"], make_conn_delay_patch(
-                s["secs_reg"], s["nanos_reg"], secs)))
+            if s.get("span", 7) == SLEEP_LOAD_LEN:
+                patch = make_sleep_load_patch(s["secs_reg"], s["nanos_reg"], secs)
+            else:
+                patch = make_conn_delay_patch(s["secs_reg"], s["nanos_reg"], secs)
+            edits.append((s["off"], patch))
 
     # -- Summary --------------------------------------------------------------
     print()
@@ -1009,10 +1306,28 @@ def self_test() -> None:
         probe = bytearray(blob)
         struct.pack_into("<d", probe, c09, bound)
         assert len(find_jitter_sites(bytes(probe))) == expected, bound
+    # No as_millis multiply -> the fixed-200ms util.rs backoff. Planting
+    # `imul rax, rax, 1000` is what retry.rs does to a Duration base.
+    assert jitter_label(bytes(blob), s) == "util.rs::backoff"
+    tagged = bytearray(blob)
+    at_imul = s["region_end"] - 7
+    tagged[at_imul:at_imul + 7] = b"\x48\x69\xc0\xe8\x03\x00\x00"
+    assert jitter_label(bytes(tagged), s) == "retry.rs::backoff"
+    # 0.159.2 puts that imul ~430 bytes before the tail, past JITTER_SCAN_BACK.
+    end = AS_MILLIS_SCAN_BACK + 32
+    far = bytearray(b"\x00" * (end + 16))
+    at_far = end - 430
+    far[at_far:at_far + 7] = b"\x48\x69\xc0\xe8\x03\x00\x00"
+    assert jitter_label(bytes(far), {"region_end": end}) == "retry.rs::backoff"
+    outside = bytearray(b"\x00" * (end + 16))
+    out_at = end - AS_MILLIS_SCAN_BACK - 2
+    outside[out_at:out_at + 7] = b"\x48\x69\xc0\xe8\x03\x00\x00"
+    assert jitter_label(bytes(outside), {"region_end": end}) == "util.rs::backoff"
     _self_test_pe_maps()
     _self_test_site3()
     _self_test_site4()
     _self_test_site5()
+    _self_test_sleep_load()
     # format detection: PE accepted, ELF rejected via die()/SystemExit.
     assert detect_format(b"MZ" + b"\x00" * 0x3a + struct.pack("<I", 0x40)
                          + b"PE\x00\x00" + struct.pack("<H", 0x8664)) == "pe"
@@ -1172,6 +1487,35 @@ def _self_test_site5() -> None:
     assert find_conn_delay_sites(b"\x00" * at + decoy + b"\x00" * 0x40) == []
     assert conn_delay_secs(1000) == 1 and conn_delay_secs(1) == 1
     assert conn_delay_secs(2400) == 2
+
+
+def _self_test_sleep_load() -> None:
+    """MSVC sleep-argument load: disp32 Duration into rdx/r8d, then lea r9,[rip]."""
+    load = (bytes.fromhex("488b91b0100000")    # mov rdx, [rcx+0x10b0]
+            + bytes.fromhex("448b81b8100000"))  # mov r8d, [rcx+0x10b8]
+    setup = (bytes.fromhex("4c8d0d00000000")   # lea r9, [rip+0]
+             + bytes.fromhex("488d0d00000000")  # lea rcx, [rip+0]
+             + b"\xe8\x00\x00\x00\x00")         # call
+    # saturating min(60s): cmp rax,0x3d ; setae sil ; cmp rax,0x3c
+    ladder = (b"\x48\x83\xf8\x3d" + b"\x40\x0f\x93\xc6" + b"\x48\x83\xf8\x3c")
+    at = 0x80
+    blob = bytearray(b"\x90" * at + load + setup + b"\x90" * 16 + ladder + b"\x90" * 16)
+    sites = [s for s in find_conn_delay_sites(bytes(blob)) if s.get("span") == SLEEP_LOAD_LEN]
+    assert len(sites) == 1, sites
+    s = sites[0]
+    assert (s["off"], s["secs_reg"], s["nanos_reg"], s["current"]) == (at, 2, 8, None), s
+    assert s["ladder"][1] == 60, s["ladder"]
+    # a short clamp is some other .min(), not the connection-retry ceiling
+    short_ladder = b"\x48\x83\xf8\x04" + b"\x40\x0f\x93\xc6" + b"\x48\x83\xf8\x03"
+    short = bytearray(b"\x90" * at + load + setup + b"\x90" * 16 + short_ladder + b"\x90" * 16)
+    assert [s for s in find_conn_delay_sites(bytes(short)) if s.get("span") == SLEEP_LOAD_LEN] == []
+    patch = make_sleep_load_patch(s["secs_reg"], s["nanos_reg"], 1)
+    assert len(patch) == SLEEP_LOAD_LEN
+    assert patch.startswith(b"\xba\x01\x00\x00\x00") and b"\x45\x31\xc0" in patch
+    patched = bytearray(blob)
+    patched[at:at + len(patch)] = patch
+    again = [s for s in find_conn_delay_sites(bytes(patched)) if s.get("span") == SLEEP_LOAD_LEN]
+    assert len(again) == 1 and again[0]["current"] == 1 and again[0]["off"] == at, again
 
 
 def main() -> None:

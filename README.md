@@ -91,7 +91,7 @@ py codex-windows.py              # 打补丁
 py codex-windows.py --restore    # 还原
 ```
 
-> 站点 4/5 的字节签名是在 **0.153.4 的 Linux ELF** 上验证的，虽然按寄存器参数化写、没有硬编码寄存器号，但**没有在 MSVC 镜像上验证过**。Windows 上先跑 `--dry-run`：不匹配时会打印 `NOT FOUND` 并跳过（只会漏打，不会写错地方）。
+> 已在 **codex 0.159.2** 的 Windows x64 PE 上对过 `--dry-run`。和 Linux 0.159.1 的段数不一样，这是 MSVC 的正常结果，不是漏匹配：抖动 3 处（`retry.rs` 1 处 + `util.rs` 形状 2 处）、站点 4 共 9 处（3 处进 `util.rs::backoff`，6 处进 `retry.rs::backoff`）、站点 5 共 3 处。站点 5 在 PE 里不是 ELF 那种 7 字节 `disp8 +0x10/+0x18`，而是 14 字节的 `disp32` 加载（秒进 `rdx`、纳秒进 `r8d`，再 `lea r9,[rip]` 调 sleep）。
 
 > 重试间隔与 stream 上限已固定为脚本内常量 `RETRY_MS = 1000`(毫秒)、
 > `STREAM_MAX_RETRIES = 9999`，**不提供 `--ms` / `--max-retries` 命令行参数**；
@@ -119,14 +119,13 @@ stream_idle_timeout_ms = 15000
 
 ### 版本适配说明（重要）
 
-脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex 0.159.1**（Linux x64 ELF，5 个站点全部命中）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过；Windows 镜像没有用 0.159.1 重新验证。
+脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex 0.159.1**（Linux x64 ELF，5 个站点全部命中）和 **codex 0.159.2**（Windows x64 PE，5 个站点全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
 
-- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出），站点 5 应有 2 处。0.159.1 上站点 4 是 4 处（两处调 `util.rs::backoff`，两处调 `retry.rs::backoff`），都要带 `verified: call ... lands in a patched backoff`。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
+- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
 - **v0.156.1 → v0.159.1 变了什么**：两个 backoff 的结构判据没变（116 个 `from_millis` 尾部里仍恰好 2 处）。`retry.rs` 把 `Duration` 换成毫秒的 `imul * 1000` 挪到了尾部前 445 字节，超出原来的 320 字节抖动窗口，标签要单独回扫 1024 字节，否则两处都会被印成 `util.rs::backoff`。站点 4 从 2 处变成 4 处，多出来的两处 call 落在 `retry.rs::backoff` 里，验证通过就照打。
 - **v0.142.4 → v0.143.0 变了什么**（供下次排查参照）：
   1. 抖动 `random_range(0.9..1.1)` 的编译产物从「相邻 `0.9`/`1.1` 常量对」改成「下限 `0.9` + 区间宽度 `0.2`」，且 `0.9` 常量被两个 backoff 去重共享，旧的「相邻 0.9/1.1 对」定位失效。
   2. 两个 backoff 函数都被**内联**进各自的 async poll，不再有独立入口，旧的「覆盖函数入口写返回 stub」打法会毁掉整个 poll 函数。
-- **现方案**：以全局唯一的 `0.9` 常量为锚，收集 `addsd` / `movsd xmm,[rip→0.9]` 候选，再用内联 `Duration::from_millis` 尾部（`mov rax,<reg>; shr rax,3; movabs 0x20c49ba5e353f7cf`）过滤，把中间抖动/base 计算段**就地**改成 `mov <reg>, <固定ms>` + NOP，得到与 attempt/jitter 无关的固定间隔。站点3（`stream_max_retries` 上限）字节码未变，逻辑照旧。
 - **v0.144.x 起第二个 backoff 用 `movsd [0.9]`**（Linux ELF 与 Windows PE 均如此），所以指令助记符本身不能作为判据；脚本对 `movsd` / `addsd` / `subsd` 一视同仁，靠下游结构定案。
 
 ### 定位原则：尽量不靠字节模式定案
