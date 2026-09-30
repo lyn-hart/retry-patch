@@ -39,16 +39,16 @@ codex 有 **5 处**会决定重试等待，脚本全部压成固定 1 秒：
 
 1. **看到的间隔 = 判定失败耗时 + 1s**，前半段脚本管不到。最坏情况是 SSE 静默满 `stream_idle_timeout_ms`（默认 300000ms = 5 分钟），所以间隔可能是 301 秒而不是 1 秒——这不是补丁失效。
 2. **想压缩前半段只能改 `config.toml`**（`stream_idle_timeout_ms`），不要去改二进制里的超时常量。
-3. **审计方式**：打完补丁后 `.orig` 与新二进制的字节 diff 必须只落在下面这 9 段里；出现第 10 段就说明有签名跑偏了。
+3. **审计方式**：打完补丁后 `.orig` 与新二进制的字节 diff 只能落在抖动退避、Retry-After、连接阶梯、stream cap 这四类改写上。0.159.1 Linux x64 是 11 段（抖动 2、站点 4 共 4、站点 5 共 2、站点 3 共 3）；站点 4 比 0.156.1 多了两处对 `retry.rs::backoff` 的调用。地址随版本变化，段数变了要重新对 `--dry-run`。
 
 ```
-[0x4a62c20, 0x4a62c64)  68B  站点1    [0x69cd08b, 0x69cd08d)   2B  站点4
-[0x59348cc, 0x59348ce)   2B  站点4    [0x69cdaf0, 0x69cdaf7)   7B  站点5
-[0x59356d5, 0x59356dc)   7B  站点5    [0x69f7528, 0x69f7557)  47B  站点2
-[0x59fa60b, 0x59fa60d)   2B  站点3    [0x6ac01ce, 0x6ac01d0)   2B  站点3
-[0x5a361a0, 0x5a361a2)   2B  站点3
+[0x51633c8, 0x51633f7)  47B  站点2 util.rs     [0x6ee34cd, 0x6ee34d1)   4B  站点3
+[0x51c5fc6, 0x51c600a)  68B  站点1 retry.rs    [0x74d4819, 0x74d481b)   2B  站点4
+[0x6dcdbca, 0x6dcdbd1)   7B  站点5             [0x7569978, 0x756997a)   2B  站点4
+[0x6dccfe0, 0x6dccfe2)   2B  站点4             [0x756a584, 0x756a58b)   7B  站点5
+[0x6e9f132, 0x6e9f136)   4B  站点3             [0x760fe76, 0x760fe7a)   4B  站点3
+                                              [0x89853a3, 0x89853a5)   2B  站点4
 ```
-（地址随 codex 版本变化，数量和归属不该变。）
 
 ### 什么算「失败」（脚本不碰这部分，仅供对照）
 
@@ -119,9 +119,10 @@ stream_idle_timeout_ms = 15000
 
 ### 版本适配说明（重要）
 
-脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex v0.153.4**（Linux x64 ELF，5 个站点全部命中）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）。
+脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex 0.159.1**（Linux x64 ELF，5 个站点全部命中）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过；Windows 镜像没有用 0.159.1 重新验证。
 
-- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`，站点 4/5 各应有 2 处。若报错（如 `expected exactly one 0.9 jitter constant, found N` 或 `expected at least 2 jittered backoff sites`）说明字节码又变了，需要重新适配。
+- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出），站点 5 应有 2 处。0.159.1 上站点 4 是 4 处（两处调 `util.rs::backoff`，两处调 `retry.rs::backoff`），都要带 `verified: call ... lands in a patched backoff`。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
+- **v0.156.1 → v0.159.1 变了什么**：两个 backoff 的结构判据没变（116 个 `from_millis` 尾部里仍恰好 2 处）。`retry.rs` 把 `Duration` 换成毫秒的 `imul * 1000` 挪到了尾部前 445 字节，超出原来的 320 字节抖动窗口，标签要单独回扫 1024 字节，否则两处都会被印成 `util.rs::backoff`。站点 4 从 2 处变成 4 处，多出来的两处 call 落在 `retry.rs::backoff` 里，验证通过就照打。
 - **v0.142.4 → v0.143.0 变了什么**（供下次排查参照）：
   1. 抖动 `random_range(0.9..1.1)` 的编译产物从「相邻 `0.9`/`1.1` 常量对」改成「下限 `0.9` + 区间宽度 `0.2`」，且 `0.9` 常量被两个 backoff 去重共享，旧的「相邻 0.9/1.1 对」定位失效。
   2. 两个 backoff 函数都被**内联**进各自的 async poll，不再有独立入口，旧的「覆盖函数入口写返回 stub」打法会毁掉整个 poll 函数。

@@ -2,14 +2,15 @@
 """
 Patch Codex CLI's retry backoff interval -- Linux/macOS build (ELF / Mach-O).
 
-Verified against codex rust-v0.143.0 (x86_64-unknown-linux-musl). This is the
+Verified against codex 0.159.1 (x86_64-unknown-linux-musl). This is the
 Unix (ELF/Mach-O) build of the codex patcher; for the Windows PE build use
 codex-windows.py. The two jittered backoffs it targets are:
 
   1. codex-client/src/retry.rs::backoff(base, attempt)  -- generic retry path
        `sleep(backoff(policy.base_delay, attempt+1))`.
   2. core/src/util.rs::backoff(attempt)                 -- stream-reconnect path
-       ("Reconnecting N/M" delay when the server sends no explicit retry-after).
+       Re-export of codex_async_utils::backoff since 0.156 ("Reconnecting N/M"
+       delay when the server sends no explicit retry-after).
 
 Both compute `Duration::from_millis((f64_delay * jitter) as u64)` with
 `jitter = rand::rng().random_range(0.9..1.1)`, and in this build both are
@@ -49,17 +50,20 @@ STREAM_MAX_RETRIES so a large stream_max_retries in config.toml is honored.
 Sites 1-2 alone do NOT give a fixed interval, because two other delay sources in
 core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
 
-  4. `let delay = err.retry_delay().unwrap_or_else(|| backoff(retry_count));`
+  4. CodexErr::retry_delay (protocol/src/error.rs). Callers do
+         server_retry_delay.unwrap_or_else(|| backoff(retry_count))
      A server-supplied Retry-After wins and `backoff()` is never called, so the
      wait becomes whatever the endpoint asked for. `Option<Duration>` is niche-
      encoded (nanos == 1_000_000_000 means None), so the branch reads:
          cmp  <r32>, 0x3b9aca00   ; None?
          jne  <skip the backoff call>
-         ...  arg setup ...
-         call <core::util::backoff>
-     NOP-ing the `jne` makes the fixed backoff unconditional. Accepted only when
-     the call provably lands inside a patched site-2 function, which is what
-     stops a look-alike Option<Duration> unwrap from ever being rewritten.
+         call <codex_async_utils::backoff>
+     NOP-ing the `jne` makes the fixed backoff unconditional. The is_retryable
+     match above that branch is not a wait, so it is left alone. Accepted only
+     when the call provably lands inside a patched backoff, which is what stops
+     a look-alike Option<Duration> unwrap from ever being rewritten. On 0.159.1
+     that accepts 4 sites: two call util.rs::backoff (the functions that also
+     hold the site-5 ladder) and two call retry.rs::backoff.
 
   5. The `unbounded_connection_retries` ladder (Stable, default ON): on a
      ConnectionFailed the delay is a separate field that starts at
@@ -137,6 +141,12 @@ JITTER_BOUND_MIN, JITTER_BOUND_MAX = 0.5, 2.0
 # may sit (the inlined base/jitter arithmetic on this build spans ~70 bytes).
 JITTER_SCAN_BACK = 320
 
+# How far back from the from_millis tail to look for retry.rs's `as_millis`
+# (`imul` by 1000). That multiply is not part of the jitter span: on 0.159.1 it
+# sits 445 bytes before the tail, outside JITTER_SCAN_BACK, so the label window
+# is separate and must not loosen site detection.
+AS_MILLIS_SCAN_BACK = 1024
+
 # `mov <reg32>, imm32` opcode base; the low 3 bits select the register.
 MOV_R32_IMM = 0xB8
 
@@ -156,8 +166,9 @@ BACKOFF_FN_WINDOW = 0x600
 SITE4_CALL_WINDOW = 24
 SITE4_JOIN_WINDOW = 32
 
-# Site 5 circuit breaker: 0.153.4 has exactly two copies of the ladder (sampling
-# and remote-compaction). A much larger count means the signature went loose, and
+# Site 5 circuit breaker: 0.159.1 still has exactly two connection ladders
+# (turn.rs sampling and compact_remote_v2.rs), each next to a site-4 caller of
+# util.rs::backoff. A much larger count means the signature went loose, and
 # site 5 rewrites live instructions, so refuse rather than guess.
 MAX_CONN_SITES = 4
 
@@ -373,7 +384,7 @@ def find_jitter_sites(data: bytes) -> list[dict]:
         fingerprint without hardcoding 0.9;
       * a span between the two that is plausibly the jitter/base arithmetic.
 
-    On the 0.153.4 image 110 tails exist and exactly 2 satisfy all three, so the
+    On the 0.159.1 image 116 tails exist and exactly 2 satisfy all three, so the
     conjunction -- not any single byte pattern -- is what identifies the sites.
     Each dict: {anchor, region_start, region_end, reg, current}."""
     out = []
@@ -460,7 +471,7 @@ def _backoff_call_after(data: bytes, start: int, in_backoff, limit: int):
 
 def find_retry_after_sites(data: bytes, jitter_sites: list[dict],
                            off2va, va2off) -> list[dict]:
-    """Offsets of the `err.retry_delay().unwrap_or_else(|| backoff(n))` branch.
+    """Offsets of `server_retry_delay.unwrap_or_else(|| backoff(n))`.
 
         cmp  <r32>, 0x3b9aca00   ; Option<Duration> niche: 1e9 == None
         jne  <past the backoff call>
@@ -691,6 +702,32 @@ def current_stream_caps(data: bytes) -> list[int]:
 SITE_LABELS = ("retry.rs::backoff", "util.rs::backoff")
 
 
+def _as_millis_before(data: bytes, end: int) -> bool:
+    """True when `Duration::as_millis` (`imul` by 1000) sits before `end`.
+
+    retry.rs::backoff scales a caller-supplied Duration (`secs * 1000 + nanos /
+    1e6`). util.rs::backoff starts from a fixed 200ms and has no such multiply.
+    The multiply can sit well above the jitter span (445 bytes on 0.159.1).
+    File order is not stable: on 0.159.1 util.rs is the lower address.
+    """
+    start = max(0, end - AS_MILLIS_SCAN_BACK)
+    limit = min(end, len(data))
+    i = start
+    while i < limit - 6:
+        op = i + 1 if 0x40 <= data[i] <= 0x4F else i
+        if op + 6 <= limit and data[op] == 0x69:
+            if struct.unpack_from("<i", data, op + 2)[0] == 1000:
+                return True
+        i += 1
+    return False
+
+
+def jitter_label(data: bytes, site: dict) -> str:
+    if _as_millis_before(data, site["region_end"]):
+        return "retry.rs::backoff"
+    return "util.rs::backoff"
+
+
 def plan(data: bytes, ms: int):
     """Return (edits, report). edits: [(off, bytes)]. report: [(label, site)]."""
     edits, report = [], []
@@ -698,11 +735,16 @@ def plan(data: bytes, ms: int):
     if len(sites) < len(SITE_LABELS):
         die(f"expected at least {len(SITE_LABELS)} jittered backoff sites "
             f"(0.9..1.1), found {len(sites)}")
-    for idx, s in enumerate(sites):
-        label = SITE_LABELS[idx] if idx < len(SITE_LABELS) else f"backoff[{idx}]"
+    for s in sites:
+        label = jitter_label(data, s)
         patch = make_jitter_patch(s["reg"], s["region_end"] - s["region_start"], ms)
         edits.append((s["region_start"], patch))
         report.append((label, s))
+    missing = [name for name in SITE_LABELS if name not in (lab for lab, _ in report)]
+    if missing:
+        got = ", ".join(lab for lab, _ in report)
+        die(f"expected both {' and '.join(SITE_LABELS)}, got {got}; "
+            f"missing {', '.join(missing)}")
     return edits, report
 
 
@@ -833,7 +875,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
 
     # -- Site 4: Retry-After outranking the fixed backoff ---------------------
     print()
-    print("=== Retry-After override (responses_retry.rs: unwrap_or_else) ===")
+    print("=== Retry-After override (CodexErr::retry_delay unwrap_or_else) ===")
     off2va, va2off = segment_maps(load_segments(bytes(data), fmt))
     ra_sites = find_retry_after_sites(bytes(data), [s for _, s in report],
                                       off2va, va2off)
@@ -843,7 +885,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
               f"  (Option<Duration> None niche)")
         print(f"        branch  : {s['len']}-byte jne @ 0x{s['jne']:x} -> {state}")
         print(f"        verified: call @ 0x{s['call']:x} lands in a patched "
-              f"util.rs::backoff")
+              f"backoff")
         print(f"        rewrite : jne -> {s['len']}-byte NOP "
               f"(server Retry-After ignored, backoff always wins)")
     if not ra_sites:
@@ -987,6 +1029,25 @@ def self_test() -> None:
         probe = bytearray(blob)
         struct.pack_into("<d", probe, c09, bound)
         assert len(find_jitter_sites(bytes(probe))) == expected, bound
+    # No as_millis multiply -> the fixed-200ms util.rs backoff. Planting
+    # `imul rax, rax, 1000` is what retry.rs does to a Duration base.
+    assert jitter_label(bytes(blob), s) == "util.rs::backoff"
+    tagged = bytearray(blob)
+    at = s["region_end"] - 7
+    tagged[at:at + 7] = b"\x48\x69\xc0\xe8\x03\x00\x00"
+    assert jitter_label(bytes(tagged), s) == "retry.rs::backoff"
+    # 0.159.1 puts that imul 445 bytes before the tail, past JITTER_SCAN_BACK.
+    # The label window has to reach it; an imul past the window stays util.rs.
+    end = AS_MILLIS_SCAN_BACK + 32
+    far = bytearray(b"\x00" * (end + 16))
+    at = end - 445
+    far[at:at + 7] = b"\x48\x69\xc0\xe8\x03\x00\x00"
+    assert jitter_label(bytes(far), {"region_end": end}) == "retry.rs::backoff"
+    outside = bytearray(b"\x00" * (end + 16))
+    # opcode (the 0x69) sits one byte before the scan window
+    out_at = end - AS_MILLIS_SCAN_BACK - 2
+    outside[out_at:out_at + 7] = b"\x48\x69\xc0\xe8\x03\x00\x00"
+    assert jitter_label(bytes(outside), {"region_end": end}) == "util.rs::backoff"
     _self_test_site3()
     _self_test_site4()
     _self_test_site5()
