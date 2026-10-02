@@ -357,7 +357,12 @@ def discover_backoff_fn(data: bytes) -> dict | None:
     `Math.pow(2,n-1)` backoffs exist in the binary (MCP reconnect, OAuth
     refresh, session persistence, ...) and every one of them is rejected.
 
-    Returns {name, body_start, base, pow, header} or None.
+    2.1.285 instead uses Math.round(shared({attempt, baseMs, capMs, jitter,
+    random})). Its complete wrapper and adjacent base declaration identify it;
+    pinning only its attempt argument preserves the shared helper elsewhere.
+
+    Returns {name, body_start, base, pow, header} or None. For the delegated
+    shape, pow has kind="attempt" and names the argument to flatten.
     """
     candidates = []
     for m in re.finditer(
@@ -377,10 +382,40 @@ def discover_backoff_fn(data: bytes) -> dict | None:
             continue
         candidates.append((window_start + header.start(), header.group(1), m))
 
-    if len(candidates) != 1:
+    # 2.1.285 delegates the calculation to a shared helper. Match the entire
+    # API wrapper, binding its parameters, jitter and Retry-After parser. The
+    # adjacent base declaration belongs to this wrapper; short minified names
+    # have unrelated numeric declarations elsewhere in the bundled modules.
+    delegated = list(re.finditer(
+        rb'(?:var|let|const) (?P<base_var>' + _IDENT + rb')=(?P<base>' + _NUMBER + rb');'
+        rb'(?P<body>function (?P<name>' + _IDENT + rb')\((?P<attempt>' + _IDENT + rb'),'
+        rb'(?P<retry>' + _IDENT + rb'),(?P<cap>' + _IDENT + rb')=' + _NUMBER + rb','
+        rb'(?P<random>' + _IDENT + rb')=Math\.random\)\{let (?P<jitter>' + _IDENT + rb')'
+        rb'=Math\.round\(' + _IDENT + rb'\(\{attempt:(?P<step>(?P=attempt)|1 *)'
+        rb',baseMs:(?P=base_var),capMs:(?P=cap),jitter:\{kind:"proportional",ratio:'
+        + _NUMBER + rb'\},random:(?P=random)\}\)\);'
+        rb'if\((?P=retry)\)\{let (?P<seconds>' + _IDENT + rb')=parseInt\((?P=retry),10\);'
+        rb'if\(!isNaN\((?P=seconds)\)\)(?P<header>return Math\.max\((?P=seconds)\*1000,'
+        rb'(?P=jitter)\)|return (?P=jitter) {2,})\}return (?P=jitter)\})', data
+    ))
+    count = len(candidates) + len(delegated)
+    if count != 1:
         print(f"  WARN: API retry backoff helper: expected 1 structural match, "
-              f"found {len(candidates)}", file=sys.stderr)
+              f"found {count}", file=sys.stderr)
         return None
+
+    if delegated:
+        m = delegated[0]
+        return {
+            "name": m.group("name"), "body_start": m.start("body"),
+            "base": {"var": m.group("base_var"), "offset": m.start("base"),
+                     "raw": m.group("base")},
+            "pow": {"offset": m.start("step"), "raw": m.group("step"),
+                    "kind": "attempt"},
+            "header": {"offset": m.start("header"), "raw": m.group("header"),
+                       "jitter": m.group("jitter"),
+                       "patched": not m.group("header").startswith(b"return Math.max")},
+        }
 
     body_start, name, m = candidates[0]
     info = {"name": name, "body_start": body_start, "pow": None,
@@ -441,7 +476,16 @@ def backoff_sites(data: bytes, fn: dict) -> list[dict]:
                     base["offset"], base["raw"], new))
 
     pw = fn["pow"]
-    if pw["raw"] == b"1":
+    if pw.get("kind") == "attempt":
+        # Flatten only the API wrapper's input, not the shared helper used by
+        # unrelated retry paths: factor ** (1 - 1) is always 1.
+        if pw["raw"].strip() == b"1":
+            sites.append(site_done("backoff_pow", "Backoff attempt already fixed to 1"))
+        else:
+            sites.append(site(
+                "backoff_pow", "Disable exponential growth (delegated attempt -> 1)",
+                pw["offset"], pw["raw"], fit_literal(["1"], len(pw["raw"]))))
+    elif pw["raw"] == b"1":
         sites.append(site_done("backoff_pow", "Exponential growth already disabled (pow base 1)"))
     else:
         sites.append(site(
@@ -500,9 +544,14 @@ def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
     lo = max(0, anchor.start() - 900)
     region = data[lo:anchor.start()]
 
-    assign = (_NOT_IDENT + re.escape(var) + rb'=(?:' + _IDENT + rb'\(' + _IDENT
-              + rb'\)\?\?)?(?:Math\.min\()?' + re.escape(fn_name) + rb'\(' + _IDENT
-              + rb'(?:,' + _IDENT + rb')*\)(?:,' + _IDENT + rb'\))?')
+    # Newer calls pass attempt sums, `void 0`, and an injected RNG property;
+    # the reset delay can also be precomputed instead of called inline.
+    arg = rb'(?:void 0|' + _IDENT + rb'(?:[.+]' + _IDENT + rb')*)'
+    call = re.escape(fn_name) + rb'\(' + arg + rb'(?:,' + arg + rb')*\)'
+    reset = _IDENT + rb'(?:\(' + _IDENT + rb'\))?\?\?'
+    assign = (_NOT_IDENT + re.escape(var) + rb'=(?:' + reset + rb')?(?:'
+              rb'Math\.min\(' + call + rb',' + _IDENT + rb'\)|' + call
+              + rb')(?=[,;)}])')
     pinned = _NOT_IDENT + re.escape(var) + re.escape(b"=%d" % TARGET_DELAY_MS) + rb' {2,}'
 
     sites = []
