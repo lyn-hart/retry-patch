@@ -47,7 +47,13 @@ def main():
     )
     assert mask(SOURCE) == mask(patched)
     renamed = re.sub(rb"\bmessage\b", b"$m", SOURCE).replace(b"errorMessage4", b"$e")
-    assert b'return $m.stopReason==="error";' in patch(renamed)
+    assert b'return $m.stopReason==="error"&&' in patch(renamed)
+    legacy = patcher["CLASSIFIER"].sub(
+        'function isRetryableAssistantError(message){'
+        + patcher["MARKER"] + 'return message.stopReason==="error";}',
+        patched.decode(),
+    ).encode()
+    assert legacy != patched and patch(legacy) == patched
     for bad in (
         SOURCE + SOURCE, b"unrelated",
         SOURCE.replace(b"stopReason", b"differentField"),
@@ -57,17 +63,26 @@ def main():
         rejects(lambda: patch(bad))
 
     # Evaluate the patched functions with Node, not just their text. No provider calls.
-    check = b"""
+    check = rb"""
 const assert = require("node:assert/strict");
 const session = new AgentSession();
 for (const errorMessage of [
   "This model is currently unavailable. Please try again later.",
-  "401 Unauthorized", "403 Forbidden", "quota exceeded", "billing",
+  "401 Unauthorized", "403 Forbidden", "402 Payment Required", "quota exceeded", "billing",
   "context overflow", "503 Service Unavailable", "", undefined
 ]) {
   const m = {stopReason: "error", errorMessage};
   assert.equal(isRetryableAssistantError(m), true);
   assert.equal(session._isRetryableError(m), true);
+}
+for (const errorMessage of [
+  'Error: ps.air-outer.com API error (402): {"message":"Budget pool quota has been exhausted. Please ask an administrator to increase the limit or\n select another budget pool.","type":"bad_response_status_code","param":"","code":"bad_response_status_code"}',
+  "Budget\npool quota has been exhausted.",
+  "BUDGET POOL QUOTA HAS BEEN EXHAUSTED.",
+]) {
+  const m = {stopReason: "error", errorMessage};
+  assert.equal(isRetryableAssistantError(m), false);
+  assert.equal(session._isRetryableError(m), false);
 }
 for (const stopReason of ["aborted", "stop", "toolUse", "length", "pending", undefined]) {
   const m = {stopReason, errorMessage: "503"};
@@ -108,18 +123,28 @@ for (const stopReason of ["aborted", "stop", "toolUse", "length", "pending", und
         assert bundle.read_bytes() == SOURCE
         process(bundle, restore=True)
         process(bundle)  # Reapply using the same pristine backup.
-        bundle.write_bytes(SOURCE + b"\n// newer installation")
-        for restore in (False, True):
-            rejects(lambda: process(bundle, restore=restore))
-        assert bundle.read_bytes().endswith(b"// newer installation")
-        assert backup.read_bytes() == SOURCE
+        bundle.write_bytes(legacy)
+        process(bundle, dry_run=True)
+        assert bundle.read_bytes() == legacy
+        process(bundle)
+        assert bundle.read_bytes() == patched and backup.read_bytes() == SOURCE
+        assert backup.stat().st_mtime_ns == backup_before.st_mtime_ns
+        bundle.write_bytes(legacy)
+        process(bundle, restore=True)
+        assert bundle.read_bytes() == SOURCE
+        for data in (SOURCE, legacy, patched):
+            bundle.write_bytes(data + b"\n// newer installation")
+            for restore in (False, True):
+                rejects(lambda: process(bundle, restore=restore))
+            assert bundle.read_bytes() == data + b"\n// newer installation"
+            assert backup.read_bytes() == SOURCE
         backup.unlink()
         bundle.write_bytes(patched)
         rejects(lambda: process(bundle))
         assert not backup.exists()
         # Partial/malformed code must not create a backup or change the file.
         partial = patcher["CLASSIFIER"].sub(
-            patcher["CLASSIFIER"].search(patched.decode())[0], SOURCE.decode()
+            lambda _: patcher["CLASSIFIER"].search(patched.decode())[0], SOURCE.decode()
         ).encode()
         bundle.write_bytes(partial)
         rejects(lambda: process(bundle))
@@ -130,8 +155,8 @@ for (const stopReason of ["aborted", "stop", "toolUse", "length", "pending", und
         # A copied/duplicate bundle is ambiguous; never guess which one Pi loads.
         (chunks / "duplicate.js").write_bytes(SOURCE)
         rejects(lambda: patcher["find_bundle"](str(root)))
-    print("OK: both retry gates, all error types, cancellation, discovery, syntax, "
-          "dry-run, backup/restore, idempotence, and upgrade/ambiguity guards")
+    print("OK: both retry gates, budget-pool exclusion, other errors, cancellation, syntax, "
+          "discovery, dry-run, backup/restore, legacy migration, idempotence, and upgrade/ambiguity guards")
 
 
 if __name__ == "__main__":

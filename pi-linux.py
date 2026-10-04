@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Patch the npm Pi CLI bundle so every failed assistant response can retry.
+"""Patch the npm Pi CLI bundle to retry assistant errors except exhausted budget pools.
 
 Linux/macOS/WSL; Python stdlib + the installed Node.js. Settings stay unchanged.
-This includes auth, quota, and context-overflow errors, but NOT user cancellation,
-successful responses, tool-result errors, or failures outside the assistant loop.
+This includes auth, other quota, and context-overflow errors, but NOT exhausted
+budget pools, user cancellation, successful responses, tool-result errors,
+or failures outside the assistant loop.
 """
 
 import argparse
@@ -46,7 +47,12 @@ def patch_bundle(data: bytes) -> bytes:
         escaped = re.escape(arg)
         body = re.sub(r"\s+", "", match["body"])
         if pattern is CLASSIFIER:
-            replacement = f'{MARKER}return {arg}.stopReason==="error";'
+            legacy = f'{MARKER}return {arg}.stopReason==="error";'
+            replacement = (
+                f'{MARKER}return {arg}.stopReason==="error"'
+                r'&&!/budget\s+pool\s+quota\s+has\s+been\s+exhausted/i.test('
+                f'{arg}.errorMessage??"");'
+            )
             expected = (
                 rf'if\({escaped}\.stopReason!=="error"\|\|!{escaped}\.errorMessage\)return!1;'
                 rf'(?:let|const|var)(?P<error>{IDENT})={escaped}\.errorMessage;'
@@ -55,13 +61,13 @@ def patch_bundle(data: bytes) -> bytes:
             )
         else:
             # Without this change context overflow bypasses the shared classifier.
-            replacement = f"{MARKER}return isRetryableAssistantError({arg});"
+            legacy = replacement = f"{MARKER}return isRetryableAssistantError({arg});"
             expected = (
                 rf'returnisContextOverflow\({escaped},'
                 rf'\(this\._modelForMessage\({escaped}\)\?\?this\.model\)'
                 rf'\?\.contextWindow\?\?0\)\?!1:isRetryableAssistantError\({escaped}\);?'
             )
-        if match["body"] != replacement and not re.fullmatch(expected, body):
+        if match["body"] not in (legacy, replacement) and not re.fullmatch(expected, body):
             raise ValueError(f"{name}: unsupported code shape; no files changed")
         edits.append((match.start("body"), match.end("body"), replacement))
     for start, end, replacement in sorted(edits, reverse=True):
@@ -125,7 +131,8 @@ def process(path: Path, *, dry_run: bool = False, restore: bool = False) -> None
         if MARKER.encode() in original:
             raise ValueError(f"Backup is not pristine: {backup}")
         expected = patch_bundle(original)
-        if current not in (original, expected):
+        # Normalize known old/new retry bodies; all other bytes must still match.
+        if patched != expected:
             raise ValueError(
                 f"Backup does not match this installation: {backup}\n"
                 "Pi may have been upgraded or edited. Refusing to overwrite either file; "
@@ -164,7 +171,7 @@ def process(path: Path, *, dry_run: bool = False, restore: bool = False) -> None
             os.fsync(stream.fileno())
         shutil.copystat(path, backup)
     atomic_write(path, target)
-    print("Restored." if restore else "Patched: all assistant error responses are now retryable.")
+    print("Restored." if restore else "Patched: assistant errors retry except exhausted budget pools.")
     print("Restart Pi. retry.enabled / maxRetries / delays still apply; settings were not changed.")
 
 
@@ -177,7 +184,7 @@ def main() -> int:
     if os.name != "posix":
         print("ERROR: Run this script inside Linux/macOS/WSL, not Windows Python.", file=sys.stderr)
         return 1
-    print("WARNING: auth/quota/context errors will also retry; cancellation remains effective.")
+    print("WARNING: auth/other quota/context errors still retry; exhausted budget pools do not.")
     print("Context-overflow recovery waits until retries are exhausted. Close Pi before applying.")
     try:
         process(find_bundle(args.package), dry_run=args.dry_run, restore=args.restore)
