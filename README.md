@@ -1,17 +1,19 @@
 # Retry / Backoff 补丁脚本 — 使用说明
 
-> 操作前先**退出正在运行的 codex / claude**；两个二进制都装在用户 npm 目录（`~/.npm-global`），**无需 sudo**；所有脚本都支持预览（`--dry-run`）和 `--restore` 还原，打补丁前自动备份为 `<binary>.orig`。
+> 操作前先**退出正在运行的 codex / claude / pi**；用户 npm 目录（`~/.npm-global`）下的安装**无需 sudo**；所有脚本都支持预览（`--dry-run`）和 `--restore` 还原，打补丁前自动备份为 `<目标文件>.orig`。
 
-按平台拆成 4 个脚本；每个脚本启动时会**检测当前系统环境**（`os.name`），跑错平台会直接拒绝并提示改用对应脚本：
+每个脚本启动时会**检测当前系统环境**（`os.name`），跑错平台会直接拒绝：
 
 | 工具 | Linux / macOS | Windows |
 |---|---|---|
 | codex | `codex-linux.py` | `codex-windows.py` |
 | claude | `claude-linux.py` | `claude-windows.py` |
+| pi | `pi-linux.py`（也支持 WSL） | 请在 WSL 内运行 Linux 版 |
 
 - codex 两版处理**真实机器码差异**：Linux 走 ELF/Mach-O 文件偏移空间；Windows 走 PE 的 VA 换算（`build_pe_off2va` / `build_pe_maps`）。两版都支持 `addsd` / `movsd [0.9]` 双锚点。
 - claude 两版补丁本体（内嵌 JS 文本）**逐字节相同**，差异仅在二进制发现、写文件、命令提示。
 - 两边都遵循同一条定位原则：**能用语义就不用字节串**，判据必须多条件同时成立，且可以在 `--dry-run` 里打印出来供人核对。
+- **pi 是不同用途**：将已失败的模型响应全部归为可重试，不改变等待参数，详见 [pi](#pi)。codex / claude 的原有行为不变。
 
 ---
 
@@ -31,7 +33,7 @@ codex 有 **5 处**会决定重试等待，脚本全部压成固定 1 秒：
 
 ### 核心规则：只改「失败之后等多久」
 
-**补丁只允许修改「已经判定失败之后，下一次尝试前等多久」。绝不修改「什么算失败」，也绝不修改「多久才判定为失败」。** 上面 5 个站点全部落在前者，这是这个仓库的硬性约束，新增站点也必须遵守。
+**补丁只允许修改「已经判定失败之后，下一次尝试前等多久」。绝不修改「什么算失败」，也绝不修改「多久才判定为失败」。** 上面 5 个站点全部落在前者，这是 codex / claude 补丁的硬性约束，新增站点也必须遵守。
 
 理由：等待时长是纯粹的数值，改错了最多是节奏不对；而失败判定改错了会把「模型正在思考」误判成断流、把成功的流当成错误中断，甚至把不可重试的致命错误变成死循环。这两类逻辑本来就有配置项，不该用改机器码的方式碰。
 
@@ -253,6 +255,50 @@ python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 3. 应全部报 
 
 ---
 
+## pi
+
+`pi-linux.py` 针对 npm 包 **`@earendil-works/pi-coding-agent` 的打包版 CLI**，已在 **1.0.2** 上验证。仅依赖 Python 3.10+ 标准库及 pi 已需安装的 Node.js；不支持独立二进制，也不修改未打包的 SDK 文件。
+
+### 作用范围：所有已失败的模型响应都可重试
+
+- 把 `isRetryableAssistantError()` 改为只判断 `stopReason === "error"`，不再检查错误文本、HTTP 状态或配额黑名单；空错误文本也重试。
+- 同时移除 `AgentSession._isRetryableError()` 的上下文超限豁免，避免外层提前跳过重试。**上下文超限会先耗尽重试次数，再进入原有压缩恢复流程**，可能只是在重复必败的请求。
+- 鉴权失败、余额不足、模型不可用等都重试；**主动取消（`aborted`）和成功响应不重试**。不会把工具执行失败、启动配置错误等变成模型重试，也不修改失败判定、超时或 provider 内层重试策略。
+- **不是无限重试**：仍遵守 `retry.enabled`、`retry.maxRetries`、`retry.baseDelayMs`、`retry.maxAgentDelayMs`；脚本不修改 `settings.json`。例如现有 `maxRetries: 99`、`baseDelayMs: 1000`、`maxAgentDelayMs: 1000` 表示每次模型调用失败后最多额外重试 99 次，每次等待 1 秒。
+
+> 此模式是主动放宽错误分类：永久性错误也会消耗全部次数，可能增加费用或触发限流。需要时可在 pi 中取消；恢复默认分类用 `--restore`。
+
+### 用法（在 WSL / Linux / macOS 终端执行）
+
+```bash
+cd /home/ubuntu/workspace/retry-patch
+python3 pi-linux.py --dry-run              # 预览，不写文件、不生成备份
+python3 pi-linux.py                        # 关闭 pi 后应用补丁
+python3 pi-linux.py --restore --dry-run    # 预览恢复
+python3 pi-linux.py --restore             # 从匹配的 .orig 恢复
+
+# PATH 中找不到 pi 时，指定 npm 包目录（不是 cli.js 或 chunk 文件）
+python3 pi-linux.py --package ~/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent --dry-run
+```
+
+自动从 PATH 中的 `pi` 解析安装目录，按两处函数定义发现实际 bundle，**不硬编码 chunk 哈希名**。两处函数均须唯一且符合已知代码结构；不匹配、歧义或 Node.js 语法检查失败时，拒绝写入。`--dry-run` 只做静态检查，不启动 pi、不恢复会话、不发送 API 请求。
+
+备份为命中 bundle 旁的 `<chunk>.js.orig`，写入使用同目录临时文件原子替换并保留权限。重复运行不会覆盖原始备份；恢复前要求当前文件与该备份的原文或补丁结果完全匹配。升级后需重新预览并应用；如果旧 `.orig` 与新安装不匹配，脚本拒绝覆盖或跨版本恢复，核实后将旧备份移走再运行。
+
+修改后重新启动 pi；无需重建或重新创建会话：
+
+```bash
+pi --session 01a10490-5593-70c4-812b-9ba8fa3840c7
+```
+
+离线回归检查：
+
+```bash
+python3 test_pi_linux.py
+```
+
+---
+
 ## 打坏了怎么恢复
 
 打补丁前脚本会自动把原始二进制备份为 `<binary>.orig`，按从易到难三选一（用你平台对应的脚本名）：
@@ -261,6 +307,7 @@ python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 3. 应全部报 
 # 1. 一键还原（推荐，靠 .orig 备份）
 python3 codex-linux.py --restore
 python3 claude-linux.py --restore
+python3 pi-linux.py --restore
 
 # 2. 手动从 .orig 拷回（脚本本身跑不了时）
 cp <binary>.orig <binary> && chmod 755 <binary>
