@@ -257,7 +257,7 @@ python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 3. 应全部报 
 
 ## pi
 
-`pi-linux.py` 针对 npm 包 **`@earendil-works/pi-coding-agent` 的打包版 CLI**，已在 **1.0.2** 上验证。仅依赖 Python 3.10+ 标准库及 pi 已需安装的 Node.js；不支持独立二进制，也不修改未打包的 SDK 文件。
+`pi-linux.py` 针对 npm 包 **`@earendil-works/pi-coding-agent` 的打包版 CLI**，已在 **1.0.3** 上验证。仅依赖 Python 3.10+ 标准库及 pi 已需安装的 Node.js；不支持独立二进制，也不修改未打包的 SDK 文件。
 
 ### 作用范围：已失败的模型响应可重试，预算池配额耗尽除外
 
