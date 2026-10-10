@@ -54,13 +54,51 @@ def check(source, pin_count):
     return bytes(result)
 
 
+def check_rate_limit():
+    """Rate-limit constants may share minified names with unrelated modules.
+
+    2.1.287 declares `hLe` (the retry threshold) at one offset and an unrelated
+    `hLe=24` UI constant elsewhere. The three names read off the retry path must
+    be resolved together, and a second declaration group must abort the patch.
+    """
+    modern = (b'var WLo=1800000,hLe=20000,GLo=600000;'
+              b'var hLe=24;'
+              b'function f(Yt){let dr=zLo(Yt),or=dr!==null&&dr<hLe;'
+              b'if(!or){let Wr=Math.max(dr??WLo,GLo)}}')
+    sites = patcher["discover_rate_limit"](modern, b"zLo")
+    assert len(sites) == 3, sites
+    result = bytearray(modern)
+    stats = {"applied": 0, "failed": 0}
+    for s in sites:
+        patcher["apply_site"](result, s, stats)
+    assert stats == {"applied": 3, "failed": 0}
+    assert b"WLo=1000" in bytes(result)
+    assert b"hLe=99999" in bytes(result)
+    assert b"GLo=1000" in bytes(result)
+    assert b"hLe=24;" in bytes(result)  # Unrelated constant untouched.
+    assert len(result) == len(modern)
+
+    # Reordered declaration group still resolves by name, not position.
+    reordered = (b'var GLo=600000,WLo=1800000,hLe=20000;'
+                 b'function f(Yt){let dr=zLo(Yt),or=dr!==null&&dr<hLe;'
+                 b'if(!or){let Wr=Math.max(dr??WLo,GLo)}}')
+    assert len(patcher["discover_rate_limit"](reordered, b"zLo")) == 3
+
+    # Two candidate groups: refuse rather than patch an ambiguous one.
+    assert patcher["discover_rate_limit"](modern + modern, b"zLo") == []
+
+    # Without the grouped declaration, fall back to the unique-name lookup.
+    legacy = (b'var hLe=20000;var WLo=1800000;var GLo=600000;'
+              b'function f(Yt){let dr=zLo(Yt);if(dr!==null&&dr<hLe){await s(dr)}'
+              b'}let Wr=Math.max(dr??WLo,GLo)')
+    assert len(patcher["discover_rate_limit"](legacy, None)) == 3
+
+
 def main():
     output = io.StringIO()
     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         check(LEGACY, 3)
         patched = check(MODERN, 2)
-        assert b"attempt:1,baseMs:le" in patched
-        assert b"mo=Math.min(mo,NNe)" in patched  # Not a backoff assignment.
 
         # Short names are reused across modules; only the adjacent base changes.
         unrelated = b"function other(){let le=500;return le}"
@@ -93,6 +131,10 @@ def main():
             source = (b"mo=ZD(Pt+F,Vn,void 0,r.random)" + suffix
                       + b';log("tengu_api_retry",{attempt:Pt,delayMs:mo})')
             assert patcher["discover_delay_pins"](source, b"ZD") == []
+        assert b"mo=Math.min(mo,NNe)" in patched  # Not a backoff assignment.
+        assert b"attempt:1,baseMs:le" in patched
+
+        check_rate_limit()
     print("OK: legacy/2.1.285 shapes, renaming, equal-length rewrites, "
           "idempotence, partial patches, and ambiguity guards")
 

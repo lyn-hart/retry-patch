@@ -633,6 +633,28 @@ def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]
             return []
         variables = (guard.group(3), fallback.group(2), fallback.group(3))
 
+    # 2.1.287 reuses the threshold name in an unrelated UI module. Resolve
+    # the three names bound above as one numeric declaration, not three global
+    # name lookups. Order and values may change; spaces include our own padding.
+    # If this grouped shape is absent, retain the legacy unique-name lookup.
+    names = rb'(?:' + b'|'.join(re.escape(v) for v in variables) + rb')'
+    pair = names + rb'=' + _NUMBER + rb' *'
+    groups = []
+    for declaration in re.finditer(
+        _NOT_IDENT + rb'(?:var|let|const) +'
+        + pair + rb'(?:,' + pair + rb'){2}(?=;)', data
+    ):
+        entries = list(re.compile(rb'(' + names + rb')=(' + _NUMBER + rb')').finditer(
+            data, declaration.start(), declaration.end()))
+        if {m.group(1) for m in entries} == set(variables) and len(set(variables)) == 3:
+            groups.append({m.group(1): m for m in entries})
+    if len(groups) > 1:
+        print(f"  WARN: rate-limit constant declaration group: expected 1 "
+              f"structural match, found {len(groups)}; refusing to guess",
+              file=sys.stderr)
+        return []
+    declarations = groups[0] if groups else None
+
     wanted = [
         ("rl_threshold", variables[0], RATE_LIMIT_THRESHOLD_MS,
          "Rate-limit inline-sleep threshold"),
@@ -643,11 +665,16 @@ def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]
     ]
     sites = []
     for key, var, target, label in wanted:
-        decl = find_unique(data, _NOT_IDENT + re.escape(var) + rb'=(' + _NUMBER + rb')',
-                           f"{label} declaration {var.decode()}")
+        if declarations is not None:
+            decl = declarations[var]
+            value_group = 2
+        else:
+            decl = find_unique(data, _NOT_IDENT + re.escape(var) + rb'=(' + _NUMBER + rb')',
+                               f"{label} declaration {var.decode()}")
+            value_group = 1
         if decl is None:
             continue
-        raw = decl.group(1)
+        raw = decl.group(value_group)
         current = parse_number(raw)
         if current == target:
             sites.append(site_done(key, f"{label} already {target}ms ({var.decode()})"))
@@ -660,7 +687,7 @@ def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]
         sites.append(site(
             key,
             f"{label} {raw.decode()} -> {target}ms ({var.decode()})",
-            decl.start(1), raw, new))
+            decl.start(value_group), raw, new))
     return sites
 
 
