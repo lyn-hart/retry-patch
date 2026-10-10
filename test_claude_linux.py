@@ -84,7 +84,18 @@ def check_rate_limit():
                  b'if(!or){let Wr=Math.max(dr??WLo,GLo)}}')
     assert len(patcher["discover_rate_limit"](reordered, b"zLo")) == 3
 
-    # Two candidate groups: refuse rather than patch an ambiguous one.
+    # Two candidate declaration groups with a single retry path: refuse rather
+    # than patch an ambiguous group. Assert on the declaration-group diagnostic
+    # specifically -- duplicating the whole fixture would instead abort earlier,
+    # on the duplicated retry path, and pass without exercising this guard.
+    duplicate = b'var WLo=1800000,hLe=20000,GLo=600000;' + modern
+    diagnostics = io.StringIO()
+    with contextlib.redirect_stderr(diagnostics):
+        assert patcher["discover_rate_limit"](duplicate, b"zLo") == []
+    assert "rate-limit constant declaration group" in diagnostics.getvalue()
+    assert "refusing to guess" in diagnostics.getvalue()
+
+    # Duplicated retry path is caught by the earlier uniqueness check.
     assert patcher["discover_rate_limit"](modern + modern, b"zLo") == []
 
     # Without the grouped declaration, fall back to the unique-name lookup.
