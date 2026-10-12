@@ -19,7 +19,7 @@
 
 ## codex
 
-codex 有 **5 处**会决定重试等待，脚本全部压成固定 1 秒：
+codex 有 **7 处**补丁站点：1–5 和 7 管等待与重试预算，站点 6 把裸 429 重新变成可重试；间隔全部压成固定 1 秒：
 
 | # | 位置 | 原行为 | 补丁 |
 |---|---|---|---|
@@ -28,20 +28,30 @@ codex 有 **5 处**会决定重试等待，脚本全部压成固定 1 秒：
 | 3 | `stream_max_retries().min(100)` | 上限硬编码 100 | 上限抬到 `STREAM_MAX_RETRIES` |
 | 4 | `err.retry_delay().unwrap_or_else(backoff)` | 服务端 `Retry-After` 优先，站点 2 被跳过 | NOP 掉 `jne`，退避无条件生效 |
 | 5 | `unbounded_connection_retries` 阶梯 | `from_secs(5)` 倍增到 60s | 每次都读成 1s |
+| 6 | `ApiRetryConfig.retry_429` | 硬编码 `false`：裸 429 直接终态，1-4 站点全不执行 | 翻成 `true`，429 变成 HTTP 层可重试 |
+| 7 | `request_max_retries().min(100)` | 上限硬编码 100，站点 6 的预算被卡死 | 上限抬到 `REQUEST_MAX_RETRIES` |
 
 > **只打 1、2 是不够的**：站点 4/5 是 0.153.x 里真正决定间隔的两条路。站点 4 让 codex **无视 `Retry-After`**——这正是补丁的目的，但别拿它去打会因为高频重试而惩罚你的端点。站点 5 的字段只能存整秒，`RETRY_MS` 会四舍五入到最少 1s。
 
+> **站点 6 是裸 429 能被重试的前提**：codex 的 HTTP 层 `RetryOn::should_retry` 本来就写了 429，但 provider 构造里 `retry_429: false` 把它关了，429 于是变成 `CodexErr::RetryLimit`；而 `retry_delay()` 对 `RetryLimit` 只认服务端 `Retry-After`，没有 `backoff()` 兜底——不带 `Retry-After` 的 429 会**一次都不重试**就结束这一轮。只打站点 1-5 时，这个 429 永远绕不到它们。
+>
+> 注意重试**次数**走的是 `request_max_retries`（默认 4，原硬上限 100，站点 7 抬到 9999），不是 `stream_max_retries`。要让长时限流墙多等一会，请在 `config.toml` 里显式设置它（例如 `request_max_retries = 50`）。
+
+> **站点 7 是站点 6 的预算开关**：`request_max_retries()` 有 `.min(100)` 硬上限（就是上面那个 100），站点 3 只抬了 stream 那一半；不抬这个的话，`config.toml` 里写 9999 也只跑 100 次。站点 3 和站点 7 分别管 stream 与 request 两个上限。
+
 ### 核心规则：只改「失败之后等多久」
 
-**补丁只允许修改「已经判定失败之后，下一次尝试前等多久」。绝不修改「什么算失败」，也绝不修改「多久才判定为失败」。** 上面 5 个站点全部落在前者，这是 codex / claude 补丁的硬性约束，新增站点也必须遵守。
+**补丁只允许修改「已经判定失败之后，下一次尝试前等多久」。绝不修改「什么算失败」，也绝不修改「多久才判定为失败」。** 这是 codex / claude 补丁的硬性约束，新增站点也必须遵守。
 
 理由：等待时长是纯粹的数值，改错了最多是节奏不对；而失败判定改错了会把「模型正在思考」误判成断流、把成功的流当成错误中断，甚至把不可重试的致命错误变成死循环。这两类逻辑本来就有配置项，不该用改机器码的方式碰。
+
+> **唯一的例外是站点 6，且必须保持得很窄。** `retry_429` 确实属于「什么可重试」，但 codex 本身已经把 429 归类为限流信号，`RetryOn::should_retry` 里也有现成的 429 分支，只是 provider 字面量把它关掉了；站点 6 只是把这个开关拨回去。它只会重发一个**已经被服务端拒绝**的请求（且下一次请求仍要先等满间隔），不可能把「模型正在思考」变成失败，也不会把致命错误变成死循环。新增其他任何站点仍须遵守上面的硬性约束。
 
 由此推出的三条：
 
 1. **看到的间隔 = 判定失败耗时 + 1s**，前半段脚本管不到。最坏情况是 SSE 静默满 `stream_idle_timeout_ms`（默认 300000ms = 5 分钟），所以间隔可能是 301 秒而不是 1 秒——这不是补丁失效。
 2. **想压缩前半段只能改 `config.toml`**（`stream_idle_timeout_ms`），不要去改二进制里的超时常量。
-3. **审计方式**：打完补丁后 `.orig` 与新二进制的字节 diff 只能落在抖动退避、Retry-After、连接阶梯、stream cap 这四类改写上。0.159.1 Linux x64 是 11 段（抖动 2、站点 4 共 4、站点 5 共 2、站点 3 共 3）；站点 4 比 0.156.1 多了两处对 `retry.rs::backoff` 的调用。地址随版本变化，段数变了要重新对 `--dry-run`。
+3. **审计方式**：打完补丁后 `.orig` 与新二进制的字节 diff 只能落在抖动退避、Retry-After、连接阶梯、stream cap、`retry_429`、request cap 这六类改写上（站点 6 固定 1 字节、站点 7 固定一段）。站点 4 比 0.156.1 多了两处对 `retry.rs::backoff` 的调用。地址随版本变化，段数变了要重新对 `--dry-run`。下面是 0.159.1 Linux x64 的 11 段示例（那一版还没有站点 6/7）：
 
 ```
 [0x51633c8, 0x51633f7)  47B  站点2 util.rs     [0x6ee34cd, 0x6ee34d1)   4B  站点3
@@ -70,6 +80,8 @@ codex 有 **5 处**会决定重试等待，脚本全部压成固定 1 秒：
 
 HTTP 请求层（站点 1，受 `request_max_retries` 管）另有一套更窄的判定，见 `codex-client/src/retry.rs::RetryOn::should_retry`：只重试 **429**、**5xx**，以及 `Timeout` / `Connection` / `Network` 三类传输错误，其他状态码一律直接返回。
 
+> 这套判定里 429 那一行一直被 provider 构造的 `retry_429: false` 关着（见站点 6），所以 429 实际会落成 `CodexErr::RetryLimit`：没带 `Retry-After` 就**一次都不重试**，带 `Retry-After` 则按它等待。站点 6 把开关拨回去后，裸 429 才真正走上面的 HTTP 重试，固定在 1s 一次。
+
 > 注意 `UsageLimitReached` 不可重试，所以站点 4「无视 `Retry-After`」影响的不是真正的配额墙（那种情况直接结束，根本不等），而是 429 / 流内限流这些**可重试**错误上服务端要求的等待时间。
 
 ### Linux / macOS — `codex-linux.py`
@@ -78,7 +90,7 @@ HTTP 请求层（站点 1，受 `request_max_retries` 管）另有一套更窄�
 # 1. 预览（不修改）
 python3 codex-linux.py --dry-run
 
-# 2. 打补丁：5 处退避全部固定 1s + stream_max_retries 上限抬到 9999
+# 2. 打补丁：7 处合计固定 1s + stream/request 上限各抬到 9999
 python3 codex-linux.py
 
 # 3. 还原
@@ -95,16 +107,22 @@ py codex-windows.py --restore    # 还原
 
 > 已在 **codex 0.159.2** 的 Windows x64 PE 上对过 `--dry-run`。和 Linux 0.159.1 的段数不一样，这是 MSVC 的正常结果，不是漏匹配：抖动 3 处（`retry.rs` 1 处 + `util.rs` 形状 2 处）、站点 4 共 9 处（3 处进 `util.rs::backoff`，6 处进 `retry.rs::backoff`）、站点 5 共 3 处。站点 5 在 PE 里不是 ELF 那种 7 字节 `disp8 +0x10/+0x18`，而是 14 字节的 `disp32` 加载（秒进 `rdx`、纳秒进 `r8d`，再 `lea r9,[rip]` 调 sleep）。
 
-> 重试间隔与 stream 上限已固定为脚本内常量 `RETRY_MS = 1000`(毫秒)、
-> `STREAM_MAX_RETRIES = 9999`，**不提供 `--ms` / `--max-retries` 命令行参数**；
-> 如需改值，直接编辑脚本顶部这两个常量。
+> 重试间隔与两个上限已固定为脚本内常量 `RETRY_MS = 1000`(毫秒)、
+> `STREAM_MAX_RETRIES = 9999`、`REQUEST_MAX_RETRIES = 9999`，**不提供
+> `--ms` / `--max-retries` 命令行参数**；如需改值，直接编辑脚本顶部这三个常量。
+
+> **站点 6/7（翻转 `retry_429`、抬高 request cap）目前只在 `codex-linux.py` 里实现。**
+> 这一版的 `codex-windows.py` 仍是 5 处；在 Windows 上碰到裸 429 也会一次不重试，
+> 而且 `request_max_retries` 仍卡在 100。PE 的两处站点编码与 ELF 不同，需要单独适配。
 
 实际重试**次数**仍由 `config.toml` 决定（脚本只抬高上限，不填就还是默认的 `stream_max_retries = 5` / `request_max_retries = 4`）：
 
 ```toml
 [model_providers.custom]
 stream_max_retries  = 9999
-request_max_retries = 10
+# 站点 6 让裸 429 可重试后，重试预算就是这个（默认 4）。站点 7 把原来的硬上限
+# 100 抬到了 9999，所以这里写多少就是多少（≤ 9999）。
+request_max_retries = 50
 # 顺带把“多久才算这次失败”也压下来：默认 stream_idle_timeout_ms 是 300000（5 分钟），
 # SSE 卡住时要耗满它才会计一次重试，看起来就像间隔远大于 1s。
 stream_idle_timeout_ms = 15000
@@ -121,9 +139,10 @@ stream_idle_timeout_ms = 15000
 
 ### 版本适配说明（重要）
 
-脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex 0.159.1**（Linux x64 ELF，5 个站点全部命中）和 **codex 0.159.2**（Windows x64 PE，5 个站点全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
+脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）和 **0.159.2**（Windows x64 PE，站点 1-5 全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
 
-- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
+- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。站点 6 在 0.162.1 Linux 上是 1 处（`HTTP 429 retryability` 小节，`movw $0x0100`）；若该节报 `NOT FOUND`，裸 429 仍会一次不重试。站点 7 也是 1 处（`request_max_retries hard cap` 小节），带 `linked: result feeds max_attempts ...`；若该节报 `NOT FOUND`，`request_max_retries` 仍卡在 100。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
+- **离线回归测试**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接）。`python3 test_codex_linux.py` 用本地 mock 服务器对着**二进制副本**跑真 codex：站点 6 关→1 次请求、开→2 次；再打站点 7 并用 1ms 间隔跑 150 次重试，得到 151 次请求（未打则会在 101 停住）。二进制不存在、字面量不是恰好 1 处、或设 `CODEX_RETRY_SKIP_E2E=1` 时自动跳过 e2e，绝不碰已安装的二进制。
 - **v0.156.1 → v0.159.1 变了什么**：两个 backoff 的结构判据没变（116 个 `from_millis` 尾部里仍恰好 2 处）。`retry.rs` 把 `Duration` 换成毫秒的 `imul * 1000` 挪到了尾部前 445 字节，超出原来的 320 字节抖动窗口，标签要单独回扫 1024 字节，否则两处都会被印成 `util.rs::backoff`。站点 4 从 2 处变成 4 处，多出来的两处 call 落在 `retry.rs::backoff` 里，验证通过就照打。
 - **v0.142.4 → v0.143.0 变了什么**（供下次排查参照）：
   1. 抖动 `random_range(0.9..1.1)` 的编译产物从「相邻 `0.9`/`1.1` 常量对」改成「下限 `0.9` + 区间宽度 `0.2`」，且 `0.9` 常量被两个 backoff 去重共享，旧的「相邻 0.9/1.1 对」定位失效。
@@ -140,13 +159,17 @@ stream_idle_timeout_ms = 15000
 | 3 | 只匹配固定中段（`cmovb` + Option 判别），**上限和 `unwrap_or` 默认值都当立即数读出** | 硬编码 `mov eax,5`、上限 100 |
 | 4 | 跟着 `call` 穿过 GOT 槽拿到函数入口，确认站点 2 改过的抖动代码落在函数体内 | 寄存器编号、`cmp/jne` 的具体编码 |
 | 5 | ①7 字节 load pair 形状②后随两条 store + RIP 相对 `lea`③同一函数内有 `.min(cap)` 的**成对** `cmp r64,cap+1` / `cmp r64,cap`（上限值读出来，不假设是 60） | 硬编码 60s、单条 `cmp`（会误命中 tracing 等级检查） |
+| 6 | ①一条 `movl $nanos,disp`（nanos 取值落在合法 Duration 区间）②同基址、位移恰为 `disp+0x08` 的 `mov r64, mem`（记下源寄存器给站点 7）③同基址、位移恰为 `disp+0x10` 的 `movw $0x0100`④紧随其后、位移为 `disp+0x12` 的 `movb $1`。四条 store 都用同一套 mem 操作数解码（disp8/disp32/REX.B），位移关系而非绝对值定案，`movw` 的高字节（retry_5xx=1）同时校验 | 硬编码 `0x98`/`0xa8` 偏移、硬编码 base_delay 200ms、硬编码寄存器 |
+| 7 | ①`cmp val,imm8` + `mov acc,imm32`（两个立即数必须相等）+ `cmovb` + `test opt,opt` + `mov res,default` + `cmovne`，且寄存器逐一对应②结果寄存器必须等于站点 6 字面量装载 `max_attempts` 的寄存器③必须落在该字面量同一函数内（±0x800）。②是语义链接，把无关的 10 处同形 `.min(100)` 全都排除 | 硬编码寄存器（r13/rax/rsi）、硬编码默认 4、硬编码偏移 |
 
-配合两道兜底：站点 5 命中超过 4 处直接拒绝（宁可不打也不猜），站点 1/2 覆写区间必须落在 5~256 字节。
+配合几道兜底：站点 5 命中超过 4 处、站点 6/7 命中超过 1 处直接拒绝（宁可不打也不猜），站点 1/2 覆写区间必须落在 5~256 字节。
 
-实测收益：站点 1/2 换成结构判据后，把抖动区间改成 `0.75..1.25` 或 `0.8..1.2` 都还能命中；站点 3 换掉默认值 5 或上限 100 都还能命中；站点 5 把 60s 上限改成 30s 也还能命中。这些都在 `--self-test` 里有对应用例。
+实测收益：站点 1/2 换成结构判据后，把抖动区间改成 `0.75..1.25` 或 `0.8..1.2` 都还能命中；站点 3 换掉默认值 5 或上限 100 都还能命中；站点 5 把 60s 上限改成 30s 也还能命中；站点 6 在 disp8/disp32/REX.B 三种编码下都能命中，站点 7 用同一套解码跟上（含 REX.B/disp8 的寄存器链接）。这些都在 `--self-test` 里有对应用例。
 - **站点 4/5 怎么定位的**（0.153.4 起新增，两处都是「就地等长改写」）：
   - 站点 4 靠 `Option<Duration>` 的 niche 编码找：`nanos == 1_000_000_000` 就是 `None`，所以分支是 `cmp <r32>,0x3b9aca00 / jne <跳过 backoff>`。光有这个模式不够（整个二进制里 `cmp <r32>,1e9` 有 680 处），所以脚本**必须**跟着 `call` 走到目标函数、确认它包含站点 2 改过的抖动代码，才肯把 `jne` 换成等长 NOP。0.153.4 里 backoff 是通过 GOT 间接调用（`call [rip+…]`），所以这里需要 VA↔文件偏移双向映射。
   - 站点 5 改的是**读取**：`mov <secs64>,[<base>+0x10] / mov <nanos32>,[<base>+0x18]` → `mov <secs32>,1 / xor <nanos32>,<nanos32>`，两边都正好 7 字节。识别条件是紧跟其后的「两条 disp32 store + 一条 RIP 相对 `lea`」——那条 `lea` 是必需的：无关代码里 `mov eax,60 / xor ecx,ecx` 加两条 store 长得跟已打过补丁的站点一模一样（实测有 6 处），只有 RIP 相对 `lea`（`warn!` 的静态等级检查）能把它们排掉。命中数超过 4 处时脚本直接拒绝打站点 5。
+  - 站点 6 锚在 `movw $0x0100` 上：`rustc` 把 `ApiRetryConfig` 字段重排为「`base_delay`(16B) → `max_attempts`(8B) → `retry_429`/`retry_5xx`/`retry_transport`」，所以字面量编译成「nanos 的 `movl` → max_attempts 的 `mov r64` → 打包二布尔的 `movw` → transport 的 `movb`」。四条 store 都要在，判据只用**相对位移**（max_attempts = nanos + 0x08，布尔 = +0x10，transport = +0x12），不写死 0x98/0xa8；并用 `Duration::nanos ≤ 999_999_999` 把无关 nanosecond 运算筛掉。max_attempts 的源寄存器留给站点 7。0.162.1 上恰好 1 处，多了就拒绝。
+  - 站点 7 用**寄存器链接**定位：`request_max_retries()` 的 `.min(100)` 与站点 6 同在 `to_api_provider`，其相位就是站点 6 字面量装载 `max_attempts` 的那个寄存器。二进制里同形的 `min`+`unwrap_or` 有 11 处（大多是无关的 `unwrap_or(1).min(...)`），只有这一处的结果寄存器与该字面量一致。改写是把整段 13/14 字节的 `cmp/mov/cmovb` 换成真正的 `.min(9999)`（`cmp imm8` 装不下 9999，只能整体改写）。
 
 #### Linux 与 Windows 拆分要点
 

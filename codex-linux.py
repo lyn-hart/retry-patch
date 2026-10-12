@@ -77,14 +77,47 @@ core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
      state machine (which is what identifies the sequence) stay in place. Site 5
      can only express whole seconds; RETRY_MS is rounded up to >=1s for it.
 
+  6. `ApiRetryConfig.retry_429` in `ModelProviderInfo::to_api_provider` is
+     hardwired to `false`, so the HTTP layer's `RetryOn::should_retry` -- which
+     lists 429 explicitly -- never gets to retry one. A 429 then falls through
+     to `CodexErr::RetryLimit`, whose `retry_delay()` arm is
+     `self.server_retry_delay()` with no `backoff()` fallback: with no
+     Retry-After the turn dies on the spot, and sites 1-4 never run. Flipping
+     the packed bool to `true` (`movw $0x0100` -> `$0x0101`) makes a bare 429
+     retryable at the HTTP layer, where the fixed 1s interval now applies for
+     `request_max_retries` attempts.
+
+  7. `request_max_retries()` clamps the configured HTTP retry budget with
+     `.min(MAX_REQUEST_MAX_RETRIES)`, which is 100 in this build. Site 3 raises
+     the stream cap; this one does the same for the request cap, so site 6's
+     enlarged budget is actually reachable. Unlike site 3, the Option
+     discriminant is already in a register here, so the clamp compiles as
+         cmp <val>,<cap> ; mov <acc>,<cap> ; cmovb <acc>,<val>
+         test <opt>,<opt> ; mov <res>,<default> ; cmovne <res>,<acc>
+     and the `cmp` is imm8 (no room for 9999). The whole 13/14-byte clamp is
+     replaced with `mov <acc>,9999 ; cmp <val>,<acc> ; cmovb <acc>,<val>`
+     (NOP-padded), i.e. a true `.min(9999)`. It is accepted only when `res` is
+     the register the site-6 literal loads `max_attempts` from, which is what
+     separates it from the many unrelated `.min(100)` shapes in the image.
+
 DESIGN RULE -- this patcher only ever changes "how long to wait after a failure
 has already been declared". It must never change what counts as a failure, nor
 how long detection takes (stream_idle_timeout_ms and friends are config, not
 patch targets). Any site added later has to satisfy that; see README.md.
 
+Site 6 is the single, deliberate exception, and it is narrow: codex already
+classifies 429 as a rate-limit signal and `RetryOn::should_retry` already has
+the 429 arm; the provider literal just disables it. Turning it back on restores
+the retry codex is built to perform, and it can only re-try a request the server
+already refused -- it cannot turn a *thinking* model into a failure.
+
 This changes the retry *interval*, not the retry *count*; use config.toml's
 stream_max_retries/request_max_retries for the count (site 3 just unclamps the
-stream cap so values >100 take effect).
+stream cap so values >100 take effect). Site 6 makes 429 retryable, but the
+budget is still `request_max_retries` (default 4, hard cap 100 in this build),
+so set it explicitly when a long rate-limit wall is expected. Site 7 raises
+that hard cap to REQUEST_MAX_RETRIES, so `request_max_retries = 9999` now means
+9999 retries at the fixed interval.
 
 Site 4 makes codex ignore Retry-After, so a genuine quota wall is retried every
 second instead of when the server said to come back. That is the point of the
@@ -104,6 +137,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -181,6 +215,35 @@ LADDER_WINDOW = 0x1000
 # min() (on this build a single `setae` sits between them).
 LADDER_PAIR_GAP = 12
 
+# Site 6: `ApiRetryConfig.retry_429` in ModelProviderInfo::to_api_provider.
+# rustc reorders the fields to put the 16-byte Duration first, so the literal
+# compiles to a nanosecond store, then a packed 16-bit retry_429/retry_5xx
+# store at nanos+0x10, then the retry_transport byte at nanos+0x12:
+#   +0x00 base_delay.secs   +0x08 base_delay.nanos   +0x10 max_attempts
+#   +0x18 retry_429  +0x19 retry_5xx  +0x1a retry_transport
+# Duration::nanos is validity-restricted to 0..=999_999_999, so a store of a
+# value in that range is a plausible base_delay and nothing else nearby is.
+RETRY_429_NANOS_MAX = 999_999_999
+# How far the nanos store may sit before the packed bool pair (the max_attempts
+# `mov` between them is a few bytes; this is generous on purpose).
+RETRY_429_SCAN_BACK = 64
+# imm16 of the `movw`: (retry_5xx << 8) | retry_429. Upstream has retry_5xx true
+# and retry_429 false; this patch flips the low byte to 1.
+RETRY_429_FALSE, RETRY_429_TRUE = 0x0100, 0x0101
+# `movw $imm16, disp(%base)` with an optional REX prefix (needed when the base
+# register is r8..r15). Used only to pick candidate offsets; _mov_imm_store()
+# is what actually decodes and validates each one.
+RETRY_429_MOVW = re.compile(rb"\x66[\x40-\x4f]?\xc7")
+# Same refuse-to-guess cap as site 7: the verified image has exactly one literal.
+MAX_RETRY_429_SITES = 1
+
+# Site 7: the `request_max_retries().min(MAX_REQUEST_MAX_RETRIES)` clamp, which
+# has its own shape in the same function as the site-6 literal. The Option
+# discriminant is already in a register here (site 3's form compares it in
+# memory), so a site is confirmed by linking its result register to the
+# `max_attempts` slot of that literal, not by a fixed byte pattern.
+REQUEST_CAP_WINDOW = 0x800   # how far the clamp may sit from the site-6 literal
+
 # 32-bit GP register names by 4-bit register number (for readable logs).
 REG_NAMES = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
              "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d")
@@ -195,6 +258,7 @@ REGION_MIN, REGION_MAX = 5, 256  # sanity bounds on the span we overwrite
 # Fixed policy (no longer CLI-configurable): retry interval and stream cap.
 RETRY_MS = 1000          # fixed retry interval in milliseconds
 STREAM_MAX_RETRIES = 9999  # raise the stream_max_retries hard cap (default 100) to this
+REQUEST_MAX_RETRIES = 9999  # raise the request_max_retries hard cap (default 100) to this
 
 
 def die(msg: str) -> None:
@@ -698,6 +762,325 @@ def current_stream_caps(data: bytes) -> list[int]:
     return sorted({s["cap"] for s in find_stream_cap_sites(data)})
 
 
+# ── Site 6: HTTP-layer 429 retryability (ApiRetryConfig.retry_429) ────────────
+def _mem_operand(data: bytes, j: int, rex: int):
+    """ModR/M memory operand at `j`. Rejects register-direct, SIB, RIP-relative.
+
+    Returns {reg, base, disp, end} where `reg` is the ModR/M reg field (REX.R
+    extended) and `end` is the first byte after the displacement."""
+    n = len(data)
+    if j >= n:
+        return None
+    modrm = data[j]
+    if (modrm & 0xC0) == 0xC0:
+        return None
+    mod, rm = modrm >> 6, modrm & 7
+    if rm == 0b100:                        # SIB: base is not a plain register
+        return None
+    if mod == 0 and rm == 0b101:           # RIP-relative
+        return None
+    disp_len = 0 if mod == 0 else 1 if mod == 1 else 4
+    end = j + 1 + disp_len
+    if end > n:
+        return None
+    disp = 0 if disp_len == 0 else int.from_bytes(
+        data[j + 1:end], "little", signed=True)
+    return {
+        "reg": ((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3),
+        "base": rm | ((rex & 1) << 3),
+        "disp": disp,
+        "end": end,
+    }
+
+
+def _mov_imm_store(data: bytes, off: int):
+    """Decode `mov{b,w,l} $imm, disp(%base)` at `off`, or None.
+
+    Handles the 0x66 operand-size prefix (movw) and an optional REX prefix that
+    extends the base register. Only the immediate-to-memory form with reg=000
+    (/0) is accepted; register-direct, SIB and RIP-relative encodings are
+    rejected. `imm_off` is where the little-endian immediate starts, so a
+    1-byte flag inside it can be rewritten in place."""
+    n = len(data)
+    j = off
+    if j >= n:
+        return None
+    opsize16 = False
+    if data[j] == 0x66:
+        opsize16 = True
+        j += 1
+    rex = 0
+    if j < n and 0x40 <= data[j] <= 0x4F:
+        rex = data[j]
+        j += 1
+    if j + 1 >= n:
+        return None
+    op = data[j]
+    if opsize16:
+        if op != 0xC7:
+            return None
+        imm_len = 2
+    elif op == 0xC7:
+        imm_len = 4
+    elif op == 0xC6:
+        imm_len = 1
+    else:
+        return None
+    if ((data[j + 1] >> 3) & 7) != 0:      # C6/C7 /0
+        return None
+    mem = _mem_operand(data, j + 1, rex)
+    if mem is None:
+        return None
+    imm_off = mem["end"]
+    if imm_off + imm_len > n:
+        return None
+    imm = int.from_bytes(data[imm_off:imm_off + imm_len], "little")
+    return {"off": off, "opsize16": opsize16, "op": op, "imm_len": imm_len,
+            "imm": imm, "imm_off": imm_off, "base": mem["base"],
+            "disp": mem["disp"], "end": imm_off + imm_len}
+
+
+def _nanos_store_before(data: bytes, start: int, base: int, disp: int):
+    """The nearest `movl $nanos, disp(%base)` before `start`, or None.
+
+    That store is base_delay: `Duration::from_millis(200)` folds to a 32-bit
+    nanosecond field. Requiring a *valid* Duration nanosecond count is what
+    keeps an arbitrary `movl` store from being mistaken for it."""
+    for off in range(start - 1, max(0, start - RETRY_429_SCAN_BACK) - 1, -1):
+        st = _mov_imm_store(data, off)
+        if (st is not None and st["op"] == 0xC7 and not st["opsize16"]
+                and st["imm_len"] == 4 and st["base"] == base
+                and st["disp"] == disp and st["end"] <= start
+                and 0 < st["imm"] <= RETRY_429_NANOS_MAX):
+            return st
+    return None
+
+
+def find_retry_429_sites(data: bytes) -> list[dict]:
+    """Sites of `ApiRetryConfig { retry_429: false, retry_5xx: true, .. }`.
+
+    The literal in ModelProviderInfo::to_api_provider compiles to
+
+        movl $<nanos>, N(%r)        ; base_delay = Duration::from_millis(200)
+        mov  <r64>, (N+0x8)(%r)     ; max_attempts
+        movw $0x0100, (N+0x10)(%r)  ; retry_429 = 0, retry_5xx = 1
+        movb $0x1, (N+0x12)(%r)     ; retry_transport = 1
+
+    (rustc reorders the fields; the +0x10/+0x12 offsets from the nanos field,
+    rather than any absolute displacement, are what identify it.) All four
+    stores are required -- including max_attempts, whose source register is
+    recorded so site 7 can link the `.min(100)` clamp without a second decoder.
+    Flipping the low immediate byte to 1 turns `retry_429: false` into `true`,
+    so the HTTP layer's `RetryOn::should_retry` -- which already lists 429 --
+    stops returning a bare 429 as a terminal `RetryLimit`. The already-true
+    form is reported so --dry-run stays idempotent. Each dict: {movw, imm,
+    imm_off, base, disp, base_delay_nanos, max_attempts_reg, patched}."""
+    out: list[dict] = []
+    for m in RETRY_429_MOVW.finditer(data):
+        i = m.start()
+        st = _mov_imm_store(data, i)
+        if (st is not None and st["opsize16"]
+                and st["imm"] in (RETRY_429_FALSE, RETRY_429_TRUE)):
+            base, disp = st["base"], st["disp"]
+            # retry_transport is the byte right after the packed pair.
+            tr = _mov_imm_store(data, st["end"])
+            if (tr is not None and tr["op"] == 0xC6 and tr["base"] == base
+                    and tr["disp"] == disp + 2 and tr["imm"] == 1):
+                nano = _nanos_store_before(data, i, base, disp - 0x10)
+                maxa = _r64_store_before(data, i, base, disp - 0x08)
+                if nano is not None and maxa is not None:
+                    out.append({"movw": i, "imm": st["imm"],
+                                "imm_off": st["imm_off"], "base": base,
+                                "disp": disp, "base_delay_nanos": nano["imm"],
+                                "max_attempts_reg": maxa["src"],
+                                "patched": st["imm"] == RETRY_429_TRUE})
+    return out
+
+
+def _r64_store(data: bytes, off: int):
+    """Decode `mov r64, disp(%base)` (`REX.W 89 /r`) at `off`, or None.
+
+    Same mem-operand rules as `_mov_imm_store` (disp8/disp32, REX.B base,
+    REX.R source). REX.W is required: without it `89` is a 32-bit store."""
+    n = len(data)
+    if off >= n:
+        return None
+    rex, j = 0, off
+    if 0x40 <= data[j] <= 0x4F:
+        rex = data[j]
+        j += 1
+    if (rex & 0x08) == 0 or j >= n or data[j] != 0x89:
+        return None
+    mem = _mem_operand(data, j + 1, rex)
+    if mem is None:
+        return None
+    return {"off": off, "src": mem["reg"], "base": mem["base"],
+            "disp": mem["disp"], "end": mem["end"]}
+
+
+def _r64_store_before(data: bytes, start: int, base: int, disp: int):
+    """The nearest `mov <r64>, disp(%base)` before `start`, or None."""
+    for off in range(start - 1, max(0, start - RETRY_429_SCAN_BACK) - 1, -1):
+        st = _r64_store(data, off)
+        if (st is not None and st["base"] == base and st["disp"] == disp
+                and st["end"] <= start):
+            return st
+    return None
+
+
+# ── Site 7: request_max_retries hard cap (site 3's idea, register form) ──────
+def _dec_mov_r32_imm(data: bytes, off: int):
+    """`mov r32, imm32` (`b8+rd`, optional REX.B prefix) -> (reg, imm, end)."""
+    j = off
+    rex_b = False
+    if j < len(data) and data[j] == 0x41:
+        rex_b, j = True, j + 1
+    if j + 5 > len(data) or not (0xB8 <= data[j] <= 0xBF):
+        return None
+    return ((data[j] - 0xB8) | (0x8 if rex_b else 0),
+            int.from_bytes(data[j + 1 : j + 5], "little"), j + 5)
+
+
+def _dec_cmp_r64_imm8(data: bytes, off: int):
+    """`cmp r/m64, imm8` (`REX.W 83 /7`, mod=11) -> (rm, imm8, end)."""
+    if off + 4 > len(data) or not (0x48 <= data[off] <= 0x4F):
+        return None
+    if data[off + 1] != 0x83:
+        return None
+    modrm = data[off + 2]
+    if (modrm & 0xC0) != 0xC0 or ((modrm >> 3) & 7) != 7:
+        return None
+    return ((modrm & 7) | ((data[off] & 1) << 3), data[off + 3], off + 4)
+
+
+def _dec_rr(data: bytes, off: int, opcode: int):
+    """`REX.W <opcode> /r`, mod=11 -> (reg, rm, end), or None."""
+    if off + 3 > len(data) or not (0x48 <= data[off] <= 0x4F):
+        return None
+    if data[off + 1] != opcode or (data[off + 2] & 0xC0) != 0xC0:
+        return None
+    rex, modrm = data[off], data[off + 2]
+    return (((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3),
+            (modrm & 7) | ((rex & 1) << 3), off + 3)
+
+
+def _dec_cmov(data: bytes, off: int, opcode: int):
+    """`REX.W 0f <opcode> /r`, mod=11 (`cmovcc`) -> (reg, rm, end), or None."""
+    if off + 4 > len(data) or not (0x48 <= data[off] <= 0x4F):
+        return None
+    if data[off + 1] != 0x0F or data[off + 2] != opcode:
+        return None
+    modrm = data[off + 3]
+    if (modrm & 0xC0) != 0xC0:
+        return None
+    rex = data[off]
+    return (((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3),
+            (modrm & 7) | ((rex & 1) << 3), off + 4)
+
+
+def _decode_request_cap(data: bytes, off: int):
+    """Decode the unpatched `.min(cap)` half at `off`, or None.
+
+    `unwrap_or(default).min(cap)` with the Option discriminant in a register:
+
+        cmp  <val64>, <cap>       83 /7 imm8   (mod=11, reg=7)
+        mov  <acc32>, <cap>       b8+acc imm32
+        cmovb <acc64>, <val64>    0f 42 /r
+        test <opt64>, <opt64>     85 /r  (reg == rm)
+        mov  <res32>, <default>   b8+res imm32
+        cmovne <res64>, <acc64>   0f 45 /r
+
+    Both immediates of the clamp must agree (they are the same constant), and
+    every register has to line up across the pair, so this cannot drift into a
+    look-alike. Returned dict: {off, cap, default, val, acc, res, patched}."""
+    c = _dec_cmp_r64_imm8(data, off)
+    if c is None:
+        return None
+    val, cap8, p = c
+    m1 = _dec_mov_r32_imm(data, p)
+    if m1 is None:
+        return None
+    acc, cap32, p = m1
+    cb = _dec_cmov(data, p, 0x42)          # cmovb acc, val
+    if cb is None or cb[0] != acc or cb[1] != val:
+        return None
+    t = _dec_rr(data, cb[2], 0x85)         # test opt, opt
+    if t is None or t[0] != t[1]:
+        return None
+    m2 = _dec_mov_r32_imm(data, t[2])
+    if m2 is None:
+        return None
+    res, default, p = m2
+    cn = _dec_cmov(data, p, 0x45)          # cmovne res, acc
+    if cn is None or cn[0] != res or cn[1] != acc:
+        return None
+    if cap8 != cap32:
+        return None
+    return {"off": off, "len": cb[2] - off, "cap": cap32, "default": default,
+            "val": val, "acc": acc, "res": res, "patched": False}
+
+
+def _decode_request_cap_patched(data: bytes, off: int):
+    """Recognize the site-7 rewrite so --dry-run stays idempotent:
+
+        mov <acc32>, REQUEST_MAX_RETRIES ; cmp <val64>,<acc64> ;
+        cmovb <acc64>,<val64>   (then NOP padding to the original length)"""
+    m = _dec_mov_r32_imm(data, off)
+    if m is None or m[1] != REQUEST_MAX_RETRIES:
+        return None
+    acc, cap, p = m
+    cm = _dec_rr(data, p, 0x39)            # cmp val, acc
+    if cm is None or cm[0] != acc:
+        return None
+    val = cm[1]
+    cb = _dec_cmov(data, cm[2], 0x42)      # cmovb acc, val
+    if cb is None or cb[0] != acc or cb[1] != val:
+        return None
+    return {"off": off, "cap": cap, "default": None, "val": val,
+            "acc": acc, "res": None, "patched": True}
+
+
+def make_request_cap_patch(acc: int, val: int, region_len: int,
+                           cap: int = REQUEST_MAX_RETRIES) -> bytes:
+    """`mov <acc32>,cap ; cmp <val64>,<acc64> ; cmovb <acc64>,<val64>` + NOPs.
+
+    Padded to exactly `region_len` -- the length of the `cmp`/`mov`/`cmovb` it
+    replaces (13 bytes when the accumulator is below r8, 14 when the original
+    `mov` carried a REX.B prefix) -- so nothing downstream shifts."""
+    if not (0 <= acc < 16 and 0 <= val < 16):
+        die("site 7 register out of range")
+    rex = 0x48 | (0x4 if acc >= 8 else 0) | (1 if val >= 8 else 0)
+    modrm = 0xC0 | ((acc & 7) << 3) | (val & 7)
+    mov = (b"\x41" if acc >= 8 else b"") + bytes([0xB8 + (acc & 7)]) + struct.pack("<I", cap)
+    patch = mov + bytes([rex, 0x39, modrm]) + bytes([rex, 0x0F, 0x42, modrm])
+    if len(patch) > region_len:
+        die(f"site 7 rewrite needs {len(patch)}B but the clamp is {region_len}B")
+    return patch + b"\x90" * (region_len - len(patch))
+
+
+def find_request_cap_sites(data: bytes, literals: list[dict]) -> list[dict]:
+    """Sites of the `request_max_retries().min(MAX_REQUEST_MAX_RETRIES)` clamp.
+
+    Confirmed only when the clamp sits in the same function as an
+    `ApiRetryConfig` literal *and* its result register is the one that literal
+    loads `max_attempts` from -- that is what distinguishes it from the many
+    unrelated `unwrap_or(n).min(100)` shapes in the image. Already-patched
+    sites are reported so the patch stays idempotent."""
+    out: list[dict] = []
+    for lit in literals:
+        want = lit["max_attempts_reg"]
+        lo = max(0, lit["movw"] - REQUEST_CAP_WINDOW)
+        hi = min(len(data) - 13, lit["movw"] + REQUEST_CAP_WINDOW)
+        for off in range(lo, hi):
+            st = _decode_request_cap(data, off) or _decode_request_cap_patched(data, off)
+            if st is None or abs(off - lit["movw"]) >= REQUEST_CAP_WINDOW:
+                continue
+            if not st["patched"] and st["res"] != want:
+                continue
+            out.append(st)
+    return out
+
+
 # ── Plan ──────────────────────────────────────────────────────────────────────
 SITE_LABELS = ("retry.rs::backoff", "util.rs::backoff")
 
@@ -830,6 +1213,8 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     validate_ms(ms)
     if not (1 <= max_retries <= 0xFFFF_FFFF):
         die("STREAM_MAX_RETRIES must be between 1 and 4294967295")
+    if not (1 <= REQUEST_MAX_RETRIES <= 0xFFFF_FFFF):
+        die("REQUEST_MAX_RETRIES must be between 1 and 4294967295")
     data = bytearray(binary.read_bytes())
     fmt = detect_format(bytes(data))  # elf/macho only; PE is rejected
 
@@ -924,6 +1309,55 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
             edits.append((s["off"], make_conn_delay_patch(
                 s["secs_reg"], s["nanos_reg"], secs)))
 
+    # -- Site 6: HTTP-layer 429 retryability ----------------------------------
+    print()
+    print("=== HTTP 429 retryability (ApiRetryConfig.retry_429) ===")
+    ra429_sites = find_retry_429_sites(bytes(data))
+    if len(ra429_sites) > MAX_RETRY_429_SITES:
+        print(f"  {len(ra429_sites)} site(s) matched where at most {MAX_RETRY_429_SITES} "
+              f"is plausible - REFUSING to patch site 6 (signature went loose)")
+        ra429_sites = []
+    for idx, s in enumerate(ra429_sites, 1):
+        state = "already true" if s["patched"] else "false"
+        print(f"  [{idx}] movw $0x{s['imm']:04x} @ 0x{s['movw']:x}"
+              f"  (base_delay {s['base_delay_nanos'] / 1e6:g}ms)")
+        print(f"        retry_429 = {state} -> true")
+        print(f"        rewrite : imm16 low byte @ 0x{s['imm_off']:x} 00 -> 01 "
+              f"(a bare 429 becomes retryable at the HTTP layer)")
+    if not ra429_sites:
+        print("  NOT FOUND - skipping (a 429 with no Retry-After stays terminal; "
+              "only a 429 that carries Retry-After is retried)")
+    for s in ra429_sites:
+        if not s["patched"]:
+            edits.append((s["imm_off"], b"\x01"))
+
+    # -- Site 7: request_max_retries hard cap ---------------------------------
+    print()
+    print("=== request_max_retries hard cap ===")
+    req_sites = find_request_cap_sites(bytes(data), ra429_sites)
+    if len(req_sites) > 1:
+        print(f"  {len(req_sites)} site(s) matched where at most 1 is plausible - "
+              f"REFUSING to patch site 7 (signature went loose)")
+        req_sites = []
+    for idx, s in enumerate(req_sites, 1):
+        cur = f"already {s['cap']}" if s["patched"] else s["cap"]
+        dflt = "?" if s["default"] is None else s["default"]
+        print(f"  [{idx}] clamp @ 0x{s['off']:x}  "
+              f"(val={reg_name(s['val'])} acc={reg_name(s['acc'])})")
+        print(f"        linked  : result feeds max_attempts of the "
+              f"ApiRetryConfig literal (unwrap_or default {dflt})")
+        print(f"        current : {cur} -> {REQUEST_MAX_RETRIES}")
+        span = f"{s['len']}B -> " if s.get("len") is not None else ""
+        print(f"        rewrite : {span}mov {reg_name(s['acc'])},{REQUEST_MAX_RETRIES} ; "
+              f"cmp {reg_name(s['val'])},{reg_name(s['acc'])} ; "
+              f"cmovb {reg_name(s['acc'])},{reg_name(s['val'])}")
+    if not req_sites:
+        print(f"  NOT FOUND - skipping (request_max_retries stays capped at 100)")
+    for s in req_sites:
+        if not s["patched"]:
+            edits.append((s["off"], make_request_cap_patch(
+                s["acc"], s["val"], s["len"], REQUEST_MAX_RETRIES)))
+
     # -- Summary --------------------------------------------------------------
     print()
     print("=== Summary ===")
@@ -931,6 +1365,8 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     print(f"  stream cap   : {len(cap_sites)} site(s) -> {max_retries}")
     print(f"  retry-after  : {len(ra_sites)} site(s) -> ignored")
     print(f"  conn ladder  : {len(conn_sites)} site(s) -> {secs}s flat")
+    print(f"  retry 429    : {len(ra429_sites)} site(s) -> retryable")
+    print(f"  request cap  : {len(req_sites)} site(s) -> {REQUEST_MAX_RETRIES}")
     print(f"  retry interval: {ms}ms")
 
     if dry_run:
@@ -963,6 +1399,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     print()
     print(f"Patched successfully: {len(report)} jitter + {len(ra_sites)} "
           f"retry-after + {len(conn_sites)} conn-ladder + {len(cap_sites)} cap "
+          f"+ {len(ra429_sites)} retry-429 + {len(req_sites)} request-cap "
           f"site(s) ({len(edits)} edit(s) written).")
     print(f"Restore with: {Path(sys.executable).name} {Path(sys.argv[0]).name} --restore")
 
@@ -1051,6 +1488,8 @@ def self_test() -> None:
     _self_test_site3()
     _self_test_site4()
     _self_test_site5()
+    _self_test_site6()
+    _self_test_site7()
     # format detection: ELF accepted, PE rejected via die()/SystemExit.
     assert detect_format(b"\x7fELF" + b"\x00" * 14 + b"\x3e\x00" + b"\x00" * 8) == "elf"
     try:
@@ -1176,6 +1615,181 @@ def _self_test_site5() -> None:
     assert find_conn_delay_sites(b"\x00" * at + decoy + b"\x00" * 0x40) == []
     assert conn_delay_secs(1000) == 1 and conn_delay_secs(1) == 1
     assert conn_delay_secs(2400) == 2
+
+
+def _self_test_site6() -> None:
+    """Synthetic `ApiRetryConfig` literal: a Duration nanos store, the
+    max_attempts store, the packed retry_429/retry_5xx `movw`, and the
+    retry_transport `movb` -- in disp8/disp32 forms and with a REX.B base."""
+    def build(nano: bytes, maxa: bytes, movw: bytes, movb: bytes) -> bytes:
+        at = 0x40
+        return b"\x00" * at + nano + maxa + movw + movb + b"\x00" * 0x40
+
+    # disp32 form (what 0.162.1 emits), base rax:
+    disp32 = build(
+        b"\xc7\x80" + struct.pack("<i", 0x98) + struct.pack("<I", 200_000_000),
+        b"\x48\x89\xb0" + struct.pack("<i", 0xA0),
+        b"\x66\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0100),
+        b"\xc6\x80" + struct.pack("<i", 0xAA) + b"\x01",
+    )
+    sites = find_retry_429_sites(disp32)
+    assert len(sites) == 1, sites
+    s = sites[0]
+    assert (s["imm"], s["base"], s["disp"], s["base_delay_nanos"],
+            s["max_attempts_reg"], s["patched"]) == (
+                0x0100, 0, 0xA8, 200_000_000, 6, False), s
+    # Flip the low immediate byte; the already-true form is recognized.
+    patched = bytearray(disp32)
+    patched[s["imm_off"]] = 0x01
+    again = find_retry_429_sites(bytes(patched))
+    assert len(again) == 1 and again[0]["patched"] is True, again
+    assert again[0]["imm"] == 0x0101
+
+    # disp32 form with a high base register (REX.B on every store).
+    rexb = build(
+        b"\x41\xc7\x80" + struct.pack("<i", 0x98) + struct.pack("<I", 200_000_000),
+        b"\x49\x89\xb0" + struct.pack("<i", 0xA0),
+        b"\x66\x41\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0100),
+        b"\x41\xc6\x80" + struct.pack("<i", 0xAA) + b"\x01",
+    )
+    r = find_retry_429_sites(rexb)
+    assert len(r) == 1 and r[0]["base"] == 8 and r[0]["max_attempts_reg"] == 6, r
+    # and the compact disp8 encoding of the same shape
+    compact = build(
+        b"\xc7\x40\x18" + struct.pack("<I", 200_000_000),
+        b"\x48\x89\x70\x20",
+        b"\x66\xc7\x40\x28" + struct.pack("<H", 0x0100),
+        b"\xc6\x40\x2a\x01",
+    )
+    c = find_retry_429_sites(compact)
+    assert len(c) == 1 and c[0]["disp"] == 0x28 and c[0]["max_attempts_reg"] == 6, c
+
+    # Negatives: every one of the four stores is load-bearing.
+    assert find_retry_429_sites(build(
+        b"\xc7\x80" + struct.pack("<i", 0x98) + struct.pack("<I", 200_000_000),
+        b"\x48\x89\xb0" + struct.pack("<i", 0xA0),
+        b"\x66\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0100),
+        b"\x00" * 7,                                   # no retry_transport byte
+    )) == []
+    assert find_retry_429_sites(build(
+        b"\xc7\x80" + struct.pack("<i", 0x98) + struct.pack("<I", 200_000_000),
+        b"\x00" * 7,                                   # no max_attempts store
+        b"\x66\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0100),
+        b"\xc6\x80" + struct.pack("<i", 0xAA) + b"\x01",
+    )) == []
+    assert find_retry_429_sites(build(
+        b"\xc7\x80" + struct.pack("<i", 0x98) + struct.pack("<I", 200_000_000),
+        b"\x48\x89\xb0" + struct.pack("<i", 0xA0),
+        b"\x66\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0102),
+        b"\xc6\x80" + struct.pack("<i", 0xAA) + b"\x01",  # retry_5xx != 1
+    )) == []
+    assert find_retry_429_sites(build(
+        b"\x00" * 11,                                 # no base_delay nanos store
+        b"\x48\x89\xb0" + struct.pack("<i", 0xA0),
+        b"\x66\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0100),
+        b"\xc6\x80" + struct.pack("<i", 0xAA) + b"\x01",
+    )) == []
+    assert find_retry_429_sites(build(
+        b"\xc7\x80" + struct.pack("<i", 0x98) + struct.pack("<I", 2_000_000_000),
+        b"\x48\x89\xb0" + struct.pack("<i", 0xA0),
+        b"\x66\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0100),
+        b"\xc6\x80" + struct.pack("<i", 0xAA) + b"\x01",  # invalid nanos
+    )) == []
+    assert _mov_imm_store(b"\xb8\x00\xc2\xeb\x0b", 0) is None  # reg-direct
+
+
+def _self_test_site7() -> None:
+    """Synthetic request-cap clamp linked to a site-6 `ApiRetryConfig` literal."""
+    def mov_imm(reg, imm):
+        return (b"\x41" if reg >= 8 else b"") + bytes([0xB8 + (reg & 7)]) + struct.pack("<I", imm)
+
+    def rr(dst, src, opcode):
+        rex = 0x48 | (1 if src >= 8 else 0) | (0x4 if dst >= 8 else 0)
+        return bytes([rex, opcode, 0xC0 | ((dst & 7) << 3) | (src & 7)])
+
+    def cmov(dst, src, op2):
+        rex = 0x48 | (1 if src >= 8 else 0) | (0x4 if dst >= 8 else 0)
+        return bytes([rex, 0x0F, op2, 0xC0 | ((dst & 7) << 3) | (src & 7)])
+
+    def clamp(acc=0, val=13, res=6, opt=12, cap=100, default=4):
+        return (bytes([0x48 | (1 if val >= 8 else 0), 0x83, 0xF8 | (val & 7), cap])
+                + mov_imm(acc, cap) + cmov(acc, val, 0x42)
+                + rr(opt, opt, 0x85) + mov_imm(res, default) + cmov(res, acc, 0x45))
+
+    def wrap(lit, clamp_bytes=None):
+        return b"\x00" * 0x40 + lit + b"\x00" * 0x40 + (clamp() if clamp_bytes is None else clamp_bytes) + b"\x00" * 0x40
+
+    def build(acc, val, res, opt=12, cap=100, default=4, lit_reg=None):
+        lit_reg = res if lit_reg is None else lit_reg
+        nano = 0x98
+        lit = (b"\xc7\x80" + struct.pack("<i", nano) + struct.pack("<I", 200_000_000)
+               + bytes([0x48 | (0x4 if lit_reg >= 8 else 0), 0x89,
+                        0x80 | ((lit_reg & 7) << 3)])
+               + struct.pack("<i", nano + 8)
+               + b"\x66\xc7\x80" + struct.pack("<i", nano + 0x10) + struct.pack("<H", 0x0100)
+               + b"\xc6\x80" + struct.pack("<i", nano + 0x12) + b"\x01")
+        return wrap(lit, clamp(acc, val, res, opt, cap, default))
+
+    # The real register set: value r13, accumulator rax, result rsi (max_attempts).
+    blob = build(acc=0, val=13, res=6)
+    lits = find_retry_429_sites(blob)
+    assert len(lits) == 1, lits
+    assert lits[0]["max_attempts_reg"] == 6, lits[0]
+    sites = find_request_cap_sites(blob, lits)
+    assert len(sites) == 1, sites
+    s = sites[0]
+    assert (s["cap"], s["default"], s["val"], s["acc"], s["res"],
+            s["patched"]) == (100, 4, 13, 0, 6, False), s
+    # The rewrite is 13 bytes (same as the three instructions it replaces).
+    patch = make_request_cap_patch(s["acc"], s["val"], s["len"], 9999)
+    assert patch == bytes.fromhex("b8 0f 27 00 00 49 39 c5 49 0f 42 c5 90"), patch.hex(" ")
+    done = bytearray(blob)
+    done[s["off"] : s["off"] + len(patch)] = patch
+    again = find_request_cap_sites(bytes(done), lits)
+    assert len(again) == 1 and again[0]["patched"] is True, again
+    # REX.B (`mov r8d, imm32`) keeps the rewrite at 13 bytes without the NOP.
+    assert make_request_cap_patch(8, 13, 14, 9999)[:2] == b"\x41\xb8"
+    assert len(make_request_cap_patch(8, 13, 14, 9999)) == 14
+    assert len(make_request_cap_patch(0, 13, 13, 9999)) == 13
+    # A retuned default is read out, not assumed.
+    retuned = build(0, 13, 6, default=7)
+    assert find_request_cap_sites(retuned, find_retry_429_sites(retuned))[0]["default"] == 7
+    # A clamp whose result is not the literal's max_attempts register is not
+    # this site -- that is what keeps unrelated `.min(100)` shapes out.
+    other = build(acc=0, val=13, res=1, lit_reg=6)
+    assert find_request_cap_sites(other, find_retry_429_sites(other)) == []
+    # Both immediates of the clamp have to agree (cmp imm8 == mov imm32).
+    bad = bytearray(blob)
+    off = _find_clamp_off(blob)
+    bad[off + 3] = 0x63                                  # cmp says 99, mov says 100
+    assert _decode_request_cap(bytes(bad), off) is None
+
+    # Site 7 must follow the same encodings site 6 already accepts.
+    rexb_lit = (
+        b"\x41\xc7\x80" + struct.pack("<i", 0x98) + struct.pack("<I", 200_000_000)
+        + b"\x49\x89\xb0" + struct.pack("<i", 0xA0)
+        + b"\x66\x41\xc7\x80" + struct.pack("<i", 0xA8) + struct.pack("<H", 0x0100)
+        + b"\x41\xc6\x80" + struct.pack("<i", 0xAA) + b"\x01"
+    )
+    compact_lit = (
+        b"\xc7\x40\x18" + struct.pack("<I", 200_000_000)
+        + b"\x48\x89\x70\x20"
+        + b"\x66\xc7\x40\x28" + struct.pack("<H", 0x0100)
+        + b"\xc6\x40\x2a\x01"
+    )
+    for name, lit in (("rexb", rexb_lit), ("disp8", compact_lit)):
+        extra = wrap(lit)
+        found = find_retry_429_sites(extra)
+        assert len(found) == 1 and found[0]["max_attempts_reg"] == 6, (name, found)
+        linked = find_request_cap_sites(extra, found)
+        assert len(linked) == 1 and linked[0]["res"] == 6, (name, linked)
+
+
+def _find_clamp_off(blob: bytes) -> int:
+    for off in range(len(blob) - 13):
+        if _decode_request_cap(blob, off) is not None:
+            return off
+    raise AssertionError("no clamp")
 
 
 def main() -> None:
