@@ -30,15 +30,18 @@ SESSION = re.compile(
 )
 
 
-def patch_bundle(data: bytes) -> bytes:
-    """Validate both known leaf functions before changing either one."""
+GATES = (
+    (CLASSIFIER, "isRetryableAssistantError"),
+    (SESSION, "AgentSession._isRetryableError"),
+)
+
+
+def patch_bundle(data: bytes, *, gates=GATES) -> bytes:
+    """Validate the selected known leaf functions before changing any of them."""
     # ponytail: match verified leaf functions, not a JS parser; re-adapt if upstream rewrites them.
     text = data.decode("utf-8")
     edits = []
-    for pattern, name in (
-        (CLASSIFIER, "isRetryableAssistantError"),
-        (SESSION, "AgentSession._isRetryableError"),
-    ):
+    for pattern, name in gates:
         matches = list(pattern.finditer(text))
         if len(matches) != 1:
             raise ValueError(f"{name}: expected one definition, found {len(matches)}")
@@ -75,32 +78,38 @@ def patch_bundle(data: bytes) -> bytes:
     return text.encode("utf-8")
 
 
-def find_bundle(package: str | None) -> Path:
+def find_bundles(package: str | None) -> list[Path]:
     if package:
         root = Path(package).expanduser().resolve()
     else:
         executable = shutil.which("pi")
         if not executable:
             raise ValueError("pi not found in PATH; use --package /path/to/pi-coding-agent")
-        root = next(
-            (p for p in Path(executable).resolve().parents if (p / "package.json").is_file()),
-            None,
-        )
+        launcher = Path(executable).resolve()
+        root = next((p for p in launcher.parents if (p / "package.json").is_file()), None)
         if root is None:
-            raise ValueError("Cannot locate the npm package; use --package")
+            # Managed Pi launches releases/<current-version>; never execute the launcher.
+            install = launcher.parent.parent / "install"
+            version_file = install / "current-version"
+            if not version_file.is_file():
+                raise ValueError("Cannot locate the npm package; use --package")
+            version = version_file.read_text(encoding="utf-8").strip()
+            if not re.fullmatch(r"[0-9A-Za-z._+-]+", version) or version in (".", ".."):
+                raise ValueError(f"Invalid managed Pi version: {version_file}")
+            root = install / "releases" / version / "node_modules" / "@earendil-works" / "pi-coding-agent"
     manifest = json.loads((root / "package.json").read_text(encoding="utf-8"))
     if manifest.get("name") != "@earendil-works/pi-coding-agent":
         raise ValueError("Expected the @earendil-works/pi-coding-agent npm package")
     print(f"Pi {manifest.get('version', '?')}: {root}")
-    # Hashes change on upgrade. Only the bundle containing BOTH definitions counts.
+    # Hashes and chunk boundaries change on upgrade; locate either gate, then validate both.
     candidates = []
     for path in sorted((root / "dist" / "bundle").rglob("*.js")):
         text = path.read_text(encoding="utf-8")
-        if CLASSIFIER.search(text) and SESSION.search(text):
+        if any(pattern.search(text) for pattern, _ in GATES):
             candidates.append(path)
-    if len(candidates) != 1:
-        raise ValueError(f"Expected one CLI retry bundle, found {len(candidates)}; unsupported build")
-    return candidates[0]
+    if not candidates:
+        raise ValueError("No CLI retry bundles found; unsupported build")
+    return candidates
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -121,56 +130,72 @@ def atomic_write(path: Path, data: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def process(path: Path, *, dry_run: bool = False, restore: bool = False) -> None:
-    current = path.read_bytes()
-    patched = patch_bundle(current)
-    backup = path.with_name(path.name + ".orig")
-    original = current
-    if backup.exists():
-        original = backup.read_bytes()
-        if MARKER.encode() in original:
-            raise ValueError(f"Backup is not pristine: {backup}")
-        expected = patch_bundle(original)
-        # Normalize known old/new retry bodies; all other bytes must still match.
-        if patched != expected:
-            raise ValueError(
-                f"Backup does not match this installation: {backup}\n"
-                "Pi may have been upgraded or edited. Refusing to overwrite either file; "
-                "move the old backup aside after checking it."
-            )
-    elif restore:
-        raise ValueError(f"No backup found: {backup}")
-    elif MARKER.encode() in current:
-        raise ValueError("Patched/partially patched bundle has no backup; refusing to back it up")
+def process(paths: list[Path], *, dry_run: bool = False, restore: bool = False) -> None:
+    contents = {path: path.read_bytes() for path in paths}
+    for pattern, name in GATES:
+        count = sum(len(list(pattern.finditer(data.decode("utf-8")))) for data in contents.values())
+        if count != 1:
+            raise ValueError(f"{name}: expected one definition across CLI bundles, found {count}")
 
-    target = original if restore else patched
-    print(f"Bundle: {path}")
-    print(f"Backup: {backup}")
-    if target == current:
+    changes = []
+    for path, current in contents.items():
+        gates = tuple((pattern, name) for pattern, name in GATES if pattern.search(current.decode("utf-8")))
+        patched = patch_bundle(current, gates=gates)
+        backup = path.with_name(path.name + ".orig")
+        original = current
+        if backup.exists():
+            original = backup.read_bytes()
+            if MARKER.encode() in original:
+                raise ValueError(f"Backup is not pristine: {backup}")
+            expected = patch_bundle(original, gates=gates)
+            # Normalize known old/new retry bodies; all other bytes must still match.
+            if patched != expected:
+                raise ValueError(
+                    f"Backup does not match this installation: {backup}\n"
+                    "Pi may have been upgraded or edited. Refusing to overwrite either file; "
+                    "move the old backup aside after checking it."
+                )
+        elif restore:
+            raise ValueError(f"No backup found: {backup}")
+        elif MARKER.encode() in current:
+            raise ValueError("Patched/partially patched bundle has no backup; refusing to back it up")
+
+        target = original if restore else patched
+        print(f"Bundle: {path}")
+        print(f"Backup: {backup}")
+        if target == current:
+            continue
+        # Parse only: never run Pi, load extensions, resume a session, or call an API.
+        node = shutil.which("node")
+        if not node:
+            raise ValueError("Node.js is required for the syntax check")
+        result = subprocess.run(
+            [node, "--input-type=module", "--check"],
+            input=target, capture_output=True, timeout=30,
+        )
+        if result.returncode:
+            raise ValueError("Node.js syntax check failed:\n" + result.stderr.decode("utf-8", "replace"))
+        changes.append((path, current, target, backup))
+
+    if not changes:
         print("Already restored." if restore else "Already patched; no changes.")
         return
-    # Parse only: never run Pi, load extensions, resume a session, or call an API.
-    node = shutil.which("node")
-    if not node:
-        raise ValueError("Node.js is required for the syntax check")
-    result = subprocess.run(
-        [node, "--input-type=module", "--check"],
-        input=target, capture_output=True, timeout=30,
-    )
-    if result.returncode:
-        raise ValueError("Node.js syntax check failed:\n" + result.stderr.decode("utf-8", "replace"))
     print("Verified: both retry gates; Node.js syntax OK.")
     if dry_run:
-        print(f"DRY RUN: would {'restore' if restore else 'patch'}; no files or backups written.")
+        print(f"DRY RUN: would {'restore' if restore else 'patch'} {len(changes)} bundle(s); "
+              "no files or backups written.")
         return
-    if not backup.exists():
-        # Exclusive creation: never overwrite an existing .orig.
-        with backup.open("xb") as stream:
-            stream.write(current)
-            stream.flush()
-            os.fsync(stream.fileno())
-        shutil.copystat(path, backup)
-    atomic_write(path, target)
+    # Validate every chunk first, then create all backups before replacing any bundle.
+    for path, current, target, backup in changes:
+        if not backup.exists():
+            # Exclusive creation: never overwrite an existing .orig.
+            with backup.open("xb") as stream:
+                stream.write(current)
+                stream.flush()
+                os.fsync(stream.fileno())
+            shutil.copystat(path, backup)
+    for path, current, target, backup in changes:
+        atomic_write(path, target)
     print("Restored." if restore else "Patched: assistant errors retry except exhausted budget pools.")
     print("Restart Pi. retry.enabled / maxRetries / delays still apply; settings were not changed.")
 
@@ -187,7 +212,7 @@ def main() -> int:
     print("WARNING: auth/other quota/context errors still retry; exhausted budget pools do not.")
     print("Context-overflow recovery waits until retries are exhausted. Close Pi before applying.")
     try:
-        process(find_bundle(args.package), dry_run=args.dry_run, restore=args.restore)
+        process(find_bundles(args.package), dry_run=args.dry_run, restore=args.restore)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

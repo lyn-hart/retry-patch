@@ -8,10 +8,9 @@ claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
   5. Ignore Retry-After / ratelimit-reset so 429s also wait ~1s
   6. Pin the API retry loop's delay to 1000ms at the assignment
 
-Linux/macOS-only build of patch-retry-claude. The byte patches are the minified
-JS text embedded in the binary and are identical on every platform; only binary
-discovery, the atomic write's exec bit, and the command hints are Unix-specific
-here. For Windows use claude-windows.py.
+Targets the code shapes in Claude Code 2.1.306; older versions are not
+supported. Patches the minified JS embedded in Linux/macOS binaries.
+For Windows use claude-windows.py (maintained separately).
 
 Usage:
   sudo python3 claude-linux.py [--dry-run] [--restore] [--binary PATH]
@@ -28,13 +27,10 @@ Environment variables (after patching):
   BUN_JSC_forceDebuggerBytecodeGeneration=1 - Recompile patched source in Bun
 
 Every patch site is located by CODE SHAPE, never by a minified identifier or a
-magic number. Bundler-generated names (`rle`, `xEf`, `wEf`, ...) change on every
-release; the structure around them does not. So each detector matches a
-skeleton -- "a function whose first parameter is the attempt counter and whose
-body starts with Math.min(BASE*Math.pow(2,attempt-1), CAP)" -- and reads the
-names and the numbers out of the match rather than hardcoding them. Names in
-docstrings below are only "what it was called in the build this was written
-against", never something the code depends on.
+magic number. Bundler-generated names change on every release, so the API
+backoff detector binds the wrapper's parameters to its shared-helper call and
+adjacent constants. It reads names and numbers from that complete shape.
+Upstream structural changes require updating the detector.
 
 Every detector is also required to be UNIQUE: if a shape matches zero or more
 than one place, the patch is skipped with a diagnostic instead of guessing.
@@ -272,232 +268,100 @@ def apply_site(data: bytearray, s: dict, stats: dict) -> None:
 # --- Detector 1: retry cap ----------------------------------------------------
 
 def discover_retry_cap(data: bytes) -> tuple[str, dict | None]:
-    """Decide whether CLAUDE_CODE_MAX_RETRIES is clamped, and neutralize it.
-
-    Two shapes exist in the wild:
-
-    a) clamped -- the env value is compared against a cap and a warning
-       `CLAUDE_CODE_MAX_RETRIES=${n} clamped to ${CAP}` is emitted. The guard
-       `if(PARSED>CAP&&...` is rewritten to `if(!1 ...` so the clamp branch
-       is dead and the raw value passes through.
-
-    b) uncapped -- the reader returns the parsed value directly. Current builds
-       look like this, so there is nothing to disable. That is VERIFIED, not
-       assumed: the reader body is matched in full and checked for the absence
-       of a clamp, so a cap reintroduced in a future build cannot be silently
-       reported as "fine".
-
-    Returns (status, site) with status in {"clamped", "uncapped", "unknown"}.
-    """
-    # (a) A clamp that announces itself.
-    for m in re.finditer(rb'CLAUDE_CODE_MAX_RETRIES=\$\{', data):
-        ctx = data[m.start():m.start() + 200]
-        clamped = re.search(rb'clamped to \$\{(' + _IDENT + rb')\}', ctx)
-        if not clamped:
-            continue
-        cap_var = clamped.group(1)
-        before = data[max(0, m.start() - 200):m.start()]
-        guard = re.search(rb'if\((' + _IDENT + rb'>' + re.escape(cap_var) + rb')\)&&', before)
-        guard = guard or re.search(
-            rb'if\((' + _IDENT + rb'>' + re.escape(cap_var) + rb')&&', before)
-        if guard:
-            off = max(0, m.start() - 200) + guard.start(1)
-            old = guard.group(1)
-            new = fit_literal(["!1"], len(old))
-            return "clamped", site(
-                "max_retries",
-                f"Disable retry cap clamp against {cap_var.decode()}",
-                off, old, new)
-        if re.search(rb'if\(!1 *&&', before):
-            return "clamped", site_done("max_retries", "Disable retry cap clamp")
-        return "unknown", None
-
-    # (b) No warning anywhere: prove the reader is genuinely uncapped.
-    reader = find_unique(
+    """Disable the retry-cap guard used by Claude Code 2.1.306."""
+    m = find_unique(
         data,
-        rb'function (' + _IDENT + rb')\(\)\{if\(process\.env\.CLAUDE_CODE_MAX_RETRIES\)'
-        rb'\{let (' + _IDENT + rb')=parseInt\(process\.env\.CLAUDE_CODE_MAX_RETRIES,10\);'
-        rb'([^{}]{0,160})\}return (' + _IDENT + rb')\}',
-        "CLAUDE_CODE_MAX_RETRIES reader",
+        rb'if\((?P<guard>' + _IDENT + rb'>' + _IDENT + rb'|!1 *)&&!'
+        + _IDENT + rb'\)\{if\(' + _IDENT
+        + rb'\(\)\.once\("max_retries_clamp_warning"\)\)' + _IDENT
+        + rb'\(`CLAUDE_CODE_MAX_RETRIES=\$\{(?P<value>' + _IDENT
+        + rb')\} clamped to \$\{(?P<cap>' + _IDENT + rb')\}`,\{level:"warn"\}\);'
+        rb'return (?P=cap)\}return (?P=value)\}',
+        "CLAUDE_CODE_MAX_RETRIES clamp",
     )
-    if reader is None:
+    if m is None:
         return "unknown", None
-    body = reader.group(3)
-    if b"Math.min" in body or b"Math.max" in body:
-        print("  WARN: the env reader clamps the value in a shape this script "
-              "does not recognize; refusing to guess", file=sys.stderr)
+    old = m.group("guard")
+    if old.strip() == b"!1":
+        return "clamped", site_done("max_retries", "Disable retry cap clamp")
+    if old != m.group("value") + b">" + m.group("cap"):
+        print("  WARN: retry cap guard and warning refer to different variables; "
+              "refusing to guess", file=sys.stderr)
         return "unknown", None
-    return "uncapped", site_done(
+    return "clamped", site(
         "max_retries",
-        f"Retry cap: none in this build ({reader.group(1).decode()} returns "
-        f"CLAUDE_CODE_MAX_RETRIES unclamped)")
+        f"Disable retry cap clamp against {m.group('cap').decode()}",
+        m.start("guard"), old, fit_literal(["!1"], len(old)))
 
 
 # --- Detector 2: the API retry backoff helper --------------------------------
 
 def discover_backoff_fn(data: bytes) -> dict | None:
-    """Locate the API retry backoff helper by shape, not by name.
+    """Match the 2.1.306 API wrapper and its adjacent base/jitter constants.
 
-    The skeleton (minified as `rle` in the build this was written against):
-
-        function NAME(attempt, retryAfter, cap = 32000) {
-            let d = Math.min(BASE * Math.pow(2, attempt - 1), cap),
-                jitter = d + Math.random() * 0.25 * d;
-            if (retryAfter) {
-                let s = parseInt(retryAfter, 10);
-                if (!isNaN(s)) return Math.max(s * 1000, jitter)   // header wins
-            }
-            return jitter
-        }
-
-    Three things identify it and nothing else in the binary satisfies all
-    three: the min() over an exponential in the function's OWN first parameter,
-    a `Math.random()` jitter term right after it, and the enclosing `function`
-    header whose first parameter is that same attempt counter. Nine other
-    `Math.pow(2,n-1)` backoffs exist in the binary (MCP reconnect, OAuth
-    refresh, session persistence, ...) and every one of them is rejected.
-
-    2.1.285 instead uses Math.round(shared({attempt, baseMs, capMs, jitter,
-    random})). Its complete wrapper and adjacent base declaration identify it;
-    pinning only its attempt argument preserves the shared helper elsewhere.
-
-    Returns {name, body_start, base, pow, header} or None. For the delegated
-    shape, pow has kind="attempt" and names the argument to flatten.
+    Bind each parameter to its use in the shared helper and Retry-After parser.
+    Only this wrapper's attempt is pinned; unrelated shared-helper calls stay
+    untouched. The same shape also recognizes our equal-length patched bytes.
     """
-    candidates = []
-    for m in re.finditer(
-        rb'Math\.min\((?:(' + _IDENT + rb')|(' + _NUMBER + rb'))'
-        rb'\*Math\.pow\(([12]),(' + _IDENT + rb')-1\),', data
-    ):
-        attempt = m.group(4)
-        # The jitter term must follow within the same statement.
-        if not re.match(rb'[^;]{0,80}?Math\.random\(\)', data[m.end():m.end() + 120]):
-            continue
-        window_start = max(0, m.start() - 400)
-        header = None
-        for f in re.finditer(rb'function (' + _IDENT + rb')\((' + _IDENT + rb')',
-                             data[window_start:m.start()]):
-            header = f
-        if header is None or header.group(2) != attempt:
-            continue
-        candidates.append((window_start + header.start(), header.group(1), m))
-
-    # 2.1.285 delegates the calculation to a shared helper. Match the entire
-    # API wrapper, binding its parameters, jitter and Retry-After parser. The
-    # adjacent base declaration belongs to this wrapper; short minified names
-    # have unrelated numeric declarations elsewhere in the bundled modules.
-    delegated = list(re.finditer(
-        rb'(?:var|let|const) (?P<base_var>' + _IDENT + rb')=(?P<base>' + _NUMBER + rb');'
+    m = find_unique(
+        data,
+        rb'(?:var|let|const) (?P<base_var>' + _IDENT + rb')=(?P<base>' + _NUMBER + rb')'
+        rb',(?P<ratio_var>' + _IDENT + rb')=' + _NUMBER + rb';'
         rb'(?P<body>function (?P<name>' + _IDENT + rb')\((?P<attempt>' + _IDENT + rb'),'
         rb'(?P<retry>' + _IDENT + rb'),(?P<cap>' + _IDENT + rb')=' + _NUMBER + rb','
-        rb'(?P<random>' + _IDENT + rb')=Math\.random\)\{let (?P<jitter>' + _IDENT + rb')'
+        rb'(?P<random>' + _IDENT + rb')=Math\.random,'
+        rb'(?P<base_arg>' + _IDENT + rb')=(?P=base_var)\)\{let (?P<jitter>' + _IDENT + rb')'
         rb'=Math\.round\(' + _IDENT + rb'\(\{attempt:(?P<step>(?P=attempt)|1 *)'
-        rb',baseMs:(?P=base_var),capMs:(?P=cap),jitter:\{kind:"proportional",ratio:'
-        + _NUMBER + rb'\},random:(?P=random)\}\)\);'
+        rb',baseMs:(?P=base_arg),capMs:(?P=cap),'
+        rb'jitter:\{kind:"proportional",ratio:(?P=ratio_var)'
+        rb'\},random:(?P=random)\}\)\);'
         rb'if\((?P=retry)\)\{let (?P<seconds>' + _IDENT + rb')=parseInt\((?P=retry),10\);'
         rb'if\(!isNaN\((?P=seconds)\)\)(?P<header>return Math\.max\((?P=seconds)\*1000,'
-        rb'(?P=jitter)\)|return (?P=jitter) {2,})\}return (?P=jitter)\})', data
-    ))
-    count = len(candidates) + len(delegated)
-    if count != 1:
-        print(f"  WARN: API retry backoff helper: expected 1 structural match, "
-              f"found {count}", file=sys.stderr)
+        rb'(?P=jitter)\)|return (?P=jitter) {2,})\}return (?P=jitter)\})',
+        "API retry backoff helper",
+    )
+    if m is None:
         return None
-
-    if delegated:
-        m = delegated[0]
-        return {
-            "name": m.group("name"), "body_start": m.start("body"),
-            "base": {"var": m.group("base_var"), "offset": m.start("base"),
-                     "raw": m.group("base")},
-            "pow": {"offset": m.start("step"), "raw": m.group("step"),
-                    "kind": "attempt"},
-            "header": {"offset": m.start("header"), "raw": m.group("header"),
-                       "jitter": m.group("jitter"),
-                       "patched": not m.group("header").startswith(b"return Math.max")},
-        }
-
-    body_start, name, m = candidates[0]
-    info = {"name": name, "body_start": body_start, "pow": None,
-            "base": None, "header": None}
-
-    # -- base: `Math.pow` multiplier, either a shared const or an inline literal
-    if m.group(1) is not None:
-        base_var = m.group(1)
-        decl = find_unique(
-            data, _NOT_IDENT + re.escape(base_var) + rb'=(' + _NUMBER + rb')',
-            f"backoff base declaration {base_var.decode()}")
-        if decl is not None:
-            info["base"] = {"var": base_var, "offset": decl.start(1),
-                            "raw": decl.group(1)}
-    else:
-        info["base"] = {"var": None, "offset": m.start(2), "raw": m.group(2)}
-
-    # -- exponent base: 2 (exponential growth) or 1 (already flattened)
-    info["pow"] = {"offset": m.start(3), "raw": m.group(3)}
-
-    # -- Retry-After override inside the same body
-    body = data[body_start:body_start + 600]
-    hdr = re.search(rb'return Math\.max\((' + _IDENT + rb')\*1000,(' + _IDENT + rb')\)', body)
-    if hdr:
-        info["header"] = {"offset": body_start + hdr.start(), "raw": hdr.group(0),
-                          "jitter": hdr.group(2), "patched": False}
-    else:
-        # Patched shape: the Math.max is gone and the jitter is returned bare.
-        done = re.search(rb'if\(!isNaN\((' + _IDENT + rb')\)\)return (' + _IDENT
-                         + rb') {2,}\}return \2', body)
-        if done:
-            info["header"] = {"patched": True}
-    return info
+    return {
+        "name": m.group("name"), "body_start": m.start("body"),
+        "base": {"var": m.group("base_var"), "offset": m.start("base"),
+                 "raw": m.group("base")},
+        "attempt": {"offset": m.start("step"), "raw": m.group("step")},
+        "header": {"offset": m.start("header"), "raw": m.group("header"),
+                   "jitter": m.group("jitter"),
+                   "patched": not m.group("header").startswith(b"return Math.max")},
+    }
 
 
-def backoff_sites(data: bytes, fn: dict) -> list[dict]:
+def backoff_sites(fn: dict) -> list[dict]:
     """Turn a discovered backoff helper into concrete rewrites."""
     sites = []
-
     base = fn["base"]
-    if base is None:
-        print("  WARN: backoff base literal not resolved", file=sys.stderr)
+    where = f"const {base['var'].decode()}"
+    if parse_number(base["raw"]) == TARGET_DELAY_MS:
+        sites.append(site_done("backoff_base", f"Backoff base already {TARGET_DELAY_MS}ms ({where})"))
     else:
-        current = parse_number(base["raw"])
-        where = (f"const {base['var'].decode()}" if base["var"]
-                 else f"inline literal in {fn['name'].decode()}()")
-        if current == TARGET_DELAY_MS:
-            sites.append(site_done("backoff_base", f"Backoff base already {TARGET_DELAY_MS}ms ({where})"))
-        else:
-            new = js_number(TARGET_DELAY_MS, len(base["raw"]))
-            if new is None:
-                print(f"  WARN: cannot fit {TARGET_DELAY_MS} into the "
-                      f"{len(base['raw'])}-byte backoff base slot", file=sys.stderr)
-            else:
-                sites.append(site(
-                    "backoff_base",
-                    f"Backoff base {base['raw'].decode()} -> {TARGET_DELAY_MS}ms ({where})",
-                    base["offset"], base["raw"], new))
-
-    pw = fn["pow"]
-    if pw.get("kind") == "attempt":
-        # Flatten only the API wrapper's input, not the shared helper used by
-        # unrelated retry paths: factor ** (1 - 1) is always 1.
-        if pw["raw"].strip() == b"1":
-            sites.append(site_done("backoff_pow", "Backoff attempt already fixed to 1"))
+        new = js_number(TARGET_DELAY_MS, len(base["raw"]))
+        if new is None:
+            print(f"  WARN: cannot fit {TARGET_DELAY_MS} into the "
+                  f"{len(base['raw'])}-byte backoff base slot", file=sys.stderr)
         else:
             sites.append(site(
-                "backoff_pow", "Disable exponential growth (delegated attempt -> 1)",
-                pw["offset"], pw["raw"], fit_literal(["1"], len(pw["raw"]))))
-    elif pw["raw"] == b"1":
-        sites.append(site_done("backoff_pow", "Exponential growth already disabled (pow base 1)"))
+                "backoff_base",
+                f"Backoff base {base['raw'].decode()} -> {TARGET_DELAY_MS}ms ({where})",
+                base["offset"], base["raw"], new))
+
+    attempt = fn["attempt"]
+    # Pin this wrapper's input, never the shared helper's exponential factor.
+    if attempt["raw"].strip() == b"1":
+        sites.append(site_done("backoff_pow", "Backoff attempt already fixed to 1"))
     else:
         sites.append(site(
-            "backoff_pow",
-            "Disable exponential growth (pow base 2 -> 1; pow(1,n) is always 1)",
-            pw["offset"], pw["raw"], b"1"))
+            "backoff_pow", "Disable exponential growth (delegated attempt -> 1)",
+            attempt["offset"], attempt["raw"], fit_literal(["1"], len(attempt["raw"]))))
 
     hdr = fn["header"]
-    if hdr is None:
-        print("  WARN: Retry-After override inside the backoff helper not found",
-              file=sys.stderr)
-    elif hdr.get("patched"):
+    if hdr["patched"]:
         sites.append(site_done("retry_after_backoff",
                                "Retry-After already ignored in the backoff helper"))
     else:
@@ -524,9 +388,8 @@ def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
     Everything assigned to that variable just above -- in the build this was
     written against:
 
-        x = resetHeaderMs(err) ?? Math.min(backoff(n, retryAfter, cap), ceil)
-        x = Math.min(backoff(n, retryAfter, cap), ceil)
-        x = backoff(attempt, retryAfter)
+        x = Math.min(resetMs ?? backoff(n, retryAfter, cap, rng), ceil)
+        x = backoff(attempt + n, retryAfter, cap, rng, customBase)
 
     -- becomes a literal 1000. Rewriting the ASSIGNMENT rather than only the
     backoff helper matters because of the `??`: a non-null reset header
@@ -544,13 +407,12 @@ def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
     lo = max(0, anchor.start() - 900)
     region = data[lo:anchor.start()]
 
-    # Newer calls pass attempt sums, `void 0`, and an injected RNG property;
-    # the reset delay can also be precomputed instead of called inline.
-    arg = rb'(?:void 0|' + _IDENT + rb'(?:[.+]' + _IDENT + rb')*)'
+    # Calls include attempt sums, an injected RNG and a conditional base.
+    value = rb'(?:void 0|' + _IDENT + rb'(?:[.+]' + _IDENT + rb')*)'
+    arg = value + rb'(?:\?' + value + rb':' + value + rb')?'
     call = re.escape(fn_name) + rb'\(' + arg + rb'(?:,' + arg + rb')*\)'
-    reset = _IDENT + rb'(?:\(' + _IDENT + rb'\))?\?\?'
-    assign = (_NOT_IDENT + re.escape(var) + rb'=(?:' + reset + rb')?(?:'
-              rb'Math\.min\(' + call + rb',' + _IDENT + rb'\)|' + call
+    assign = (_NOT_IDENT + re.escape(var) + rb'=(?:Math\.min\('
+              + _IDENT + rb'\?\?' + call + rb',' + _IDENT + rb'\)|' + call
               + rb')(?=[,;)}])')
     pinned = _NOT_IDENT + re.escape(var) + re.escape(b"=%d" % TARGET_DELAY_MS) + rb' {2,}'
 
@@ -579,64 +441,26 @@ def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
 # --- Detector 4: rate-limit fallback delays ----------------------------------
 
 def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]:
-    """Shorten the long-wait path taken when a 429 is not retried inline.
+    """Shorten the 2.1.306 retry loop's rate-limit fallback and minimum waits.
 
-        let ms = retryAfterMs(err);
-        if (ms !== null && ms < THRESHOLD) { await sleep(ms); continue }
-        let until = Math.max(ms ?? FALLBACK, MINIMUM)
-
-    FALLBACK (30min) and MINIMUM (10min) drop to 1s; THRESHOLD rises so a
-    header we failed to neutralize still costs seconds, not the 10min floor.
-    All three current values are read out of the binary and rewritten in
-    place -- nothing here searches for `=1800000`.
+    Bind the inline threshold and fallback to the same Retry-After parser
+    result, then resolve all three constants in one unique declaration group.
     """
-    guard = find_unique(
+    if ms_parser_name is None:
+        return []
+    path = find_unique(
         data,
-        rb'let (' + _IDENT + rb')=(' + _IDENT + rb')\(' + _IDENT
-        + rb'\);if\(\1!==null&&\1<(' + _IDENT + rb')\)\{',
-        "rate-limit threshold guard", warn_on_zero=False,
+        rb'let (' + _IDENT + rb')=' + re.escape(ms_parser_name)
+        + rb'\((' + _IDENT + rb')\),(' + _IDENT + rb')=\1!==null&&\1<('
+        + _IDENT + rb');[\s\S]{0,600}?if\(!\3\)\{let (' + _IDENT
+        + rb')=Math\.max\(\1\?\?(' + _IDENT + rb'),(' + _IDENT + rb')\)',
+        "rate-limit retry path",
     )
-    fallback = find_unique(
-        data,
-        rb'\}let ' + _IDENT + rb'=Math\.max\((' + _IDENT + rb')\?\?(' + _IDENT
-        + rb'),(' + _IDENT + rb')\)',
-        "rate-limit fallback/minimum", warn_on_zero=False,
-    )
-    if guard is None or fallback is None:
-        # Claude 2.1.276 folds the same path into one retry loop:
-        #   let ms = retryAfterMs(err), retry = ms !== null && ms < threshold;
-        #   ... if (!retry) { let wait = Math.max(ms ?? fallback, minimum), ... }
-        # Keep the parser name as the semantic anchor; minified identifiers and
-        # the three constants are read from this unique code shape.
-        if ms_parser_name is None:
-            return []
-        modern = find_unique(
-            data,
-            rb'let (' + _IDENT + rb')=' + re.escape(ms_parser_name)
-            + rb'\((' + _IDENT + rb')\),(' + _IDENT + rb')=\1!==null&&\1<('
-            + _IDENT + rb');[\s\S]{0,600}?if\(!\3\)\{let (' + _IDENT
-            + rb')=Math\.max\(\1\?\?(' + _IDENT + rb'),(' + _IDENT + rb')\)',
-            "rate-limit retry path (new shape)",
-        )
-        if modern is None:
-            return []
-        variables = (modern.group(4), modern.group(6), modern.group(7))
-    else:
-        if guard.group(1) != fallback.group(1):
-            print("  WARN: rate-limit guard and fallback refer to different "
-                  "variables; refusing to guess", file=sys.stderr)
-            return []
-        if ms_parser_name is not None and guard.group(2) != ms_parser_name:
-            print(f"  WARN: rate-limit guard reads {guard.group(2).decode()}, not the "
-                  f"Retry-After parser {ms_parser_name.decode()}; refusing to guess",
-                  file=sys.stderr)
-            return []
-        variables = (guard.group(3), fallback.group(2), fallback.group(3))
+    if path is None:
+        return []
+    variables = (path.group(4), path.group(6), path.group(7))
 
-    # 2.1.287 reuses the threshold name in an unrelated UI module. Resolve
-    # the three names bound above as one numeric declaration, not three global
-    # name lookups. Order and values may change; spaces include our own padding.
-    # If this grouped shape is absent, retain the legacy unique-name lookup.
+    # Short names recur in unrelated modules; resolve the constants together.
     names = rb'(?:' + b'|'.join(re.escape(v) for v in variables) + rb')'
     pair = names + rb'=' + _NUMBER + rb' *'
     groups = []
@@ -648,12 +472,12 @@ def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]
             data, declaration.start(), declaration.end()))
         if {m.group(1) for m in entries} == set(variables) and len(set(variables)) == 3:
             groups.append({m.group(1): m for m in entries})
-    if len(groups) > 1:
+    if len(groups) != 1:
         print(f"  WARN: rate-limit constant declaration group: expected 1 "
               f"structural match, found {len(groups)}; refusing to guess",
               file=sys.stderr)
         return []
-    declarations = groups[0] if groups else None
+    declarations = groups[0]
 
     wanted = [
         ("rl_threshold", variables[0], RATE_LIMIT_THRESHOLD_MS,
@@ -665,16 +489,8 @@ def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]
     ]
     sites = []
     for key, var, target, label in wanted:
-        if declarations is not None:
-            decl = declarations[var]
-            value_group = 2
-        else:
-            decl = find_unique(data, _NOT_IDENT + re.escape(var) + rb'=(' + _NUMBER + rb')',
-                               f"{label} declaration {var.decode()}")
-            value_group = 1
-        if decl is None:
-            continue
-        raw = decl.group(value_group)
+        decl = declarations[var]
+        raw = decl.group(2)
         current = parse_number(raw)
         if current == target:
             sites.append(site_done(key, f"{label} already {target}ms ({var.decode()})"))
@@ -687,7 +503,7 @@ def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]
         sites.append(site(
             key,
             f"{label} {raw.decode()} -> {target}ms ({var.decode()})",
-            decl.start(value_group), raw, new))
+            decl.start(2), raw, new))
     return sites
 
 
@@ -865,11 +681,9 @@ def discover_all(data: bytes) -> list[dict]:
     sites: list[dict] = []
 
     print("=== Patch 1: Retry cap (CLAUDE_CODE_MAX_RETRIES) ===")
-    status, cap_site = discover_retry_cap(data)
+    _, cap_site = discover_retry_cap(data)
     if cap_site is not None:
         sites.append(cap_site)
-        if status == "uncapped":
-            print(f"  {cap_site['desc']}")
     else:
         print("  SKIP: could not determine whether the retry cap is enforced",
               file=sys.stderr)
@@ -878,7 +692,7 @@ def discover_all(data: bytes) -> list[dict]:
     fn = discover_backoff_fn(data)
     if fn is not None:
         print(f"  backoff helper: {fn['name'].decode()}() @ {fn['body_start']}")
-        sites += backoff_sites(data, fn)
+        sites += backoff_sites(fn)
     else:
         print("  SKIP: API retry backoff helper not located", file=sys.stderr)
 

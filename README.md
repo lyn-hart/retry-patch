@@ -180,22 +180,24 @@ stream_idle_timeout_ms = 15000
 
 ## claude
 
-claude 有 **6 类**会决定重试等待，脚本全部压成固定 1 秒：
+`claude-linux.py` 仅针对 **Claude Code 2.1.306** 的代码结构，不保留旧版兼容。Windows 脚本独立维护，本次未同步适配。
 
-| # | 位置（当前构建的压缩名，仅供对照） | 原行为 | 补丁 |
+Linux/macOS 脚本处理以下 6 类重试逻辑：
+
+| # | 位置 | 原行为 | 补丁 |
 |---|---|---|---|
-| 1 | `CLAUDE_CODE_MAX_RETRIES` 读取函数（`vEf`） | 早期版本会把环境变量夹到内部上限 | 夹取存在就改成恒假；不存在则**验证**确实不夹后放行 |
-| 2 | API 退避函数（`rle`） | `base × 2^(n-1) × jitter` | base→1000ms、指数底 2→1 |
+| 1 | `CLAUDE_CODE_MAX_RETRIES` 读取函数 | 将环境变量夹到内部上限 | 将夹取条件改为恒假 |
+| 2 | API 退避包装函数 | 委托共享函数计算指数退避，接受自定义基础延迟 | 默认 base→1000ms、传给共享函数的 attempt→1；忽略 Retry-After |
 | 3 | SDK `calculateDefaultRetryTimeoutMillis` | `min(0.5×2^n, 8)` 秒 | 系数→1、指数底→1，约 0.75–1s |
-| 4 | 4 处 `Retry-After` / `ratelimit-reset` 读取 | 服务端要求的等待优先于退避 | 全部忽略，回落到 1s |
-| 5 | 限流长等待常量（`wEf`/`IEf`/`CEf`） | 30 分钟 / 10 分钟兜底 | 都改成 1s；内联睡眠阈值抬到 99999ms |
-| 6 | 重试循环里的 3 处延迟赋值 | `reset头 ?? min(退避, 6h)` 等 | 就地写死 `=1000` |
+| 4 | `Retry-After` / `ratelimit-reset` 读取 | 服务端要求的等待优先于退避 | 忽略头值，回落到补丁后的退避 |
+| 5 | 限流长等待常量 | 30 分钟 / 10 分钟兜底 | 都改成 1s；内联睡眠阈值抬到 99999ms |
+| 6 | 重试循环里的 2 处延迟赋值 | `min(reset头 ?? 退避(...), 上限)` 或带自定义 base 的退避 | 就地写死 `=1000` |
 
-> **站点 6 不是冗余**：watchdog 的 429 分支是 `x = resetHeader(err) ?? min(退避(...), 上限)`，`??` 会在 reset 头非空时**整条短路掉退避函数**——只打站点 2/4 的话这条路仍然等几分钟。必须改赋值本身。
+> **站点 6 不是冗余**：reset 头非空时，`??` 会短路掉退避函数；另一路调用可显式传入基础延迟。必须改赋值本身，才能避免这两条路径绕过默认 base 的补丁。
 
-### 核心规则：只改「失败之后等多久」
+### 核心规则：不改失败判定和超时
 
-与 codex 部分同一条硬性约束：**只允许修改「已经判定失败之后，下一次尝试前等多久」，绝不修改「什么算失败」，也绝不修改「多久才判定为失败」。** 上面 6 类站点全部落在前者。
+除解除重试次数上限外，**只修改已经判定失败之后、下一次尝试前的等待**；不修改「什么算失败」，也不修改「多久才判定为失败」。
 
 ### Linux / macOS — `claude-linux.py`
 
@@ -207,6 +209,8 @@ python3 claude-linux.py --restore     # 还原
 
 ### Windows — `claude-windows.py`
 
+Windows 脚本仍使用原有探测逻辑；不代表已经适配 2.1.306，运行前须独立检查 dry-run 结果。
+
 ```powershell
 # 需先关闭正在运行的 claude.exe（Windows 会锁定运行中的可执行文件）
 py claude-windows.py --dry-run
@@ -214,77 +218,69 @@ py claude-windows.py
 py claude-windows.py --restore
 ```
 
-打补丁后设置环境变量再运行 claude：
+打补丁后设置环境变量再运行 claude（脚本不会自动修改 shell 配置）：
 
 ```bash
 export CLAUDE_CODE_MAX_RETRIES=9999            # Linux / macOS
 export CLAUDE_CODE_RETRY_WATCHDOG=1            # 429/过载持续重试，并解除 15 次上限
 export BUN_JSC_forceDebuggerBytecodeGeneration=1 # 让 standalone Bun 使用已修改的源码
-$env:CLAUDE_CODE_MAX_RETRIES="9999"            # Windows (PowerShell)
+```
+
+```powershell
+$env:CLAUDE_CODE_MAX_RETRIES="9999"            # Windows
 $env:CLAUDE_CODE_RETRY_WATCHDOG="1"
 $env:BUN_JSC_forceDebuggerBytecodeGeneration="1"
 ```
 
-> 说明：claude 的 npm 包入口文件名叫 `claude.exe`（`package.json` 的 `bin` 字段就是 `bin/claude.exe`），但在 Linux 上它其实是 ELF 二进制——`.exe` 只是官方全平台统一命名，不代表格式。
+> npm 包入口 `bin/claude.exe` 在本机 Linux 上是 ELF 二进制，扩展名不代表格式。写入使用同目录临时文件原子替换，保留原所有者与权限；正在运行的会话仍使用旧二进制，需要重启才生效。
 
 ### 定位原则：只认代码形状，不认压缩名和魔数
 
-claude 的补丁本体是二进制里内嵌的压缩 JS 文本。**压缩器生成的标识符（`rle`、`xEf`、`wEf`…）每次发版都会变，写死它们等于给脚本设一个到期日。** 所以每处站点都靠**代码骨架**定位，名字和数值从匹配结果里读出来，而不是拿去搜索：
+补丁修改二进制内嵌的压缩 JS 文本。名字和数值从结构匹配结果中读取，不写死压缩标识符：
 
-| 站点 | 判据（结构，全部满足才改） | 不再依赖 |
-|---|---|---|
-| 2 | 一个 `Math.min(BASE*Math.pow(2,X-1), CAP)`，其中 ①`X` 是所在 `function` 的**第一个形参** ②紧随其后有 `Math.random()` 抖动项。二进制里另有 9 处 `Math.pow(2,n-1)` 退避（MCP 重连、OAuth 刷新、会话持久化…），全部被排除 | 函数名 `rle`、base 值 500 |
-| 3 | `calculateDefaultRetryTimeoutMillis` — SDK 由 TS 源码打包，类方法名是**真实 API 名**不被压缩，是稳定锚点 | 字面量 `0.5*Math.pow(2,` |
-| 4 | 头名 `retry-after` / `retry-after-ms` / `anthropic-ratelimit-unified-reset` 是**协议字符串**，不是压缩名；解析器骨架用回溯引用绑定同一个变量 | `xt` / `$t` / `rR` / `!s` 等压缩标识符 |
-| 5 | 兼容 stable 当前形状及后续 stable 可能采用的折叠重试循环形状；阈值守卫与兜底 `Math.max` **必须引用同一个变量**，且读取函数必须是站点 4 认出的那个解析器 | `=1800000` / `=600000` / `=20000` |
-| 6 | 锚在遥测事件 `G("tengu_api_retry",{attempt:…,delayMs:X,…})` 上——它在自己的载荷里**报出了延迟变量名**，所以改名也跟得住 | 写死 `xt=` |
-| 1 | 无夹取时不是「假设没有」：完整匹配环境变量读取函数体，确认其中没有 `Math.min`/`Math.max` 才放行 | — |
+| 站点 | Linux/macOS 当前判据 |
+|---|---|
+| 1 | 唯一的夹取守卫及警告字符串；比较条件、警告和返回值必须绑定相同变量 |
+| 2 | 完整的 `Math.round(shared({attempt,baseMs,capMs,jitter,random}))` 包装函数；要求相邻 base/ratio 声明、默认 base 参数及各处引用一致。只固定这个包装函数的 attempt，不改共享函数及无关重试路径 |
+| 3 | SDK 稳定方法名 `calculateDefaultRetryTimeoutMillis` |
+| 4 | 协议字符串 `retry-after` / `retry-after-ms` / `anthropic-ratelimit-unified-reset`，结合解析器变量绑定 |
+| 5 | 折叠重试循环中的阈值与兜底使用站点 4 解析出的同一变量；三个常量必须来自唯一的同组数值声明，不再回退到全局逐名查找 |
+| 6 | 遥测事件 `"tengu_api_retry"` 的 `delayMs` 字段绑定延迟变量，只替换附近完整的退避赋值表达式 |
 
-三道兜底：
+安全约束：
 
-1. **每个判据都要求全局唯一**。形状匹配到 0 处或 2 处以上一律跳过并打印诊断，绝不取第一个。这条不是洁癖——旧版脚本正是因为拿第一个匹配，把补丁打到了一个**毫无关系的 OAuth 刷新函数**（`bxt=kRr(e,t,n)`）上。
-2. **所有改写等长**，数值放不下就用指数写法（`500`→`1e3`），再不行右侧补空格。**绝不用前导零补位**：`0010000` 在宽松模式 JS 里是八进制 4096，在严格/ESM 下直接语法错误。
-3. **幂等**：所有「已打过」判定同样是结构判定（读出当前数值再比对），不依赖上一版脚本写了什么，所以可以对半打过的二进制增量补齐。
+1. **拒绝歧义**：目标形状不存在或不唯一时跳过并打印诊断，不猜测位置。短压缩名可在无关模块复用，常量分组定位避免误改同名变量。
+2. **所有改写等长**：必要时使用指数写法（`500`→`1e3`）或尾部空格，不用可能被解析成八进制的前导零。
+3. **识别已打补丁状态**：同样按结构识别当前值。重复 dry-run 不写文件；全部站点已打补丁时，正式写入会拒绝，保护原始 `.orig` 备份。
 
 ### 验证方式
 
-不依赖「跑起来看看」，而是三步可复现的离线校验：
-
 ```bash
+python3 test_claude_linux.py
+python3 claude-linux.py --dry-run
+# 可在原始二进制副本上验证打补丁与重复识别：
 cp <binary>.orig /tmp/claude.test
-python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 1. 每处判据是否命中
-python3 claude-linux.py           --binary /tmp/claude.test   # 2. 打一遍
-python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 3. 应全部报 already patched
+python3 claude-linux.py           --binary /tmp/claude.test
+python3 claude-linux.py --dry-run --binary /tmp/claude.test
 ```
 
-在 **Claude Code stable 2.1.267（linux-x64 ELF）** 上的实测结果：
-
-- 13 处站点全部命中，0 跳过；打补丁后再次 `--dry-run`，13 处均识别为 `already patched`，文件大小不变。
-- 每段改写连同上下文用 `node --check` 校验过语法：取一个在**原始**二进制上也能解析的窗口，同一窗口在补丁后仍解析通过。
-- 补丁后的退避函数单独取出来跑，`attempt` 从 1 到 30、`Retry-After` 从 1s 到 3600s，返回值恒为 1050–1250ms；SDK 退避恒为约 840–880ms。
-- `claude-linux.py` 与 `claude-windows.py` 的探测/汇总代码逐字符相同（29151 字符），对同一输入产出**逐字节相同**的二进制；差异仅在二进制发现、写文件、命令提示。
-
-在 **Claude Code stable 2.1.287（linux-x64 ELF）** 上：14 处站点全部命中，0 跳过，`--dry-run` 后二进制哈希不变。该版把限流内联睡眠阈值 `hLe` 复用到无关的界面模块（`var hLe=24`），因此站点 5 的三个常量改为按**同一组数值声明**定位（见下），不再逐个按名字全局搜索。
+**Claude Code 2.1.306（本机 linux-x64 ELF）**：14 处站点全部命中，零警告、零跳过；等长改写及补丁后重复识别通过。离线回归覆盖改名、部分补丁、歧义、参数绑定错误，以及限流常量同名但不相关的声明。不以此声称已经验证真实 API 重试行为。
 
 ### 参数（两版通用）
 
 | 参数 | 说明 |
 |---|---|
-| `--dry-run` | 显示将要改动的内容（含每处的改写前后），不修改二进制 |
+| `--dry-run` | 显示改写前后，不修改二进制，也不创建备份 |
 | `--restore` | 从 `.orig` 备份还原 |
 | `--binary <路径>` | 手动指定 `claude` / `claude.exe` 二进制 |
 
-### 版本适配说明
-
-当前目标是 Claude Code `stable` channel，不跟随 `latest` / `next`。结构判据比字节串耐用，但不是永久有效：上游若重写重试循环本身（而不只是改名或调参），形状就变了。升级 stable 后先跑 `--dry-run`，看 `Patches skipped` 是否为 0；某处跳过时会打印它期望的形状匹配了几处，据此定位。
-
-**压缩名复用**：2.1.287 起短压缩名会在不同模块间复用（限流阈值 `hLe` 与界面常量 `hLe=24` 同名）。站点 5 先从重试路径代码形状读出三个变量名（顺序为阈值、兜底、下限），再要求它们在**同一 `var a=?,b=?,c=?;` 声明组**里同时出现；找不到该组才退回旧的逐名查找。若出现两组候选则主动跳过，避免误改界面常量。
+升级后先跑 `--dry-run`：确认探测阶段没有 `WARN` / `SKIP`，且预期站点全部命中，不能只看最后的 `Patches skipped`。上游结构变化时需重新适配；本次未验证其他版本或 macOS 构建。
 
 ---
 
 ## pi
 
-`pi-linux.py` 针对 npm 包 **`@earendil-works/pi-coding-agent` 的打包版 CLI**，已在 **1.0.3** 上验证。仅依赖 Python 3.10+ 标准库及 pi 已需安装的 Node.js；不支持独立二进制，也不修改未打包的 SDK 文件。
+`pi-linux.py` 针对 npm 包 **`@earendil-works/pi-coding-agent` 的打包版 CLI**，已在 **1.0.3** 和本机托管安装的 **1.2.0** 上验证。仅依赖 Python 3.10+ 标准库及 pi 已需安装的 Node.js；不支持独立二进制，也不修改未打包的 SDK 文件。
 
 ### 作用范围：已失败的模型响应可重试，预算池配额耗尽除外
 
@@ -308,9 +304,9 @@ python3 pi-linux.py --restore             # 从匹配的 .orig 恢复
 python3 pi-linux.py --package ~/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent --dry-run
 ```
 
-自动从 PATH 中的 `pi` 解析安装目录，按两处函数定义发现实际 bundle，**不硬编码 chunk 哈希名**。两处函数均须唯一且符合已知代码结构；不匹配、歧义或 Node.js 语法检查失败时，拒绝写入。`--dry-run` 只做静态检查，不启动 pi、不恢复会话、不发送 API 请求。
+自动从 PATH 中的 `pi` 解析安装目录，兼容 npm 链接及托管安装的 `install/current-version` 启动器；按两处函数定义发现实际 bundle，支持两处函数位于同一或不同 chunk，**不硬编码版本号或 chunk 哈希名**。两处函数在所有候选 chunk 中均须唯一且符合已知代码结构；全部目标及其备份、Node.js 语法检查通过后才允许写入，不匹配或歧义时拒绝修改任何目标。`--dry-run` 只做静态检查，不启动 pi、不恢复会话、不发送 API 请求。
 
-备份为命中 bundle 旁的 `<chunk>.js.orig`，写入使用同目录临时文件原子替换并保留权限。重复运行不会覆盖原始备份；旧版「全部错误重试」补丁可直接升级或恢复。校验备份时仅将已知的新旧重试函数体归一化，其余内容必须完全匹配。pi 升级后需重新预览并应用；如果旧 `.orig` 与新安装不匹配，脚本拒绝覆盖或跨版本恢复，核实后将旧备份移走再运行。
+每个命中 bundle 都备份到旁边的 `<chunk>.js.orig`，全部备份创建后逐文件使用同目录临时文件原子替换并保留权限（多文件写入不是整体事务）。重复运行不会覆盖原始备份；旧版「全部错误重试」补丁可直接升级或恢复。校验备份时仅将已知的新旧重试函数体归一化，其余内容必须完全匹配。pi 升级后需重新预览并应用；如果旧 `.orig` 与新安装不匹配，脚本拒绝覆盖或跨版本恢复，核实后将旧备份移走再运行。
 
 修改后重新启动 pi；无需重建或重新创建会话：
 
