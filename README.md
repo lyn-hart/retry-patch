@@ -142,7 +142,7 @@ stream_idle_timeout_ms = 15000
 脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）和 **0.159.2**（Windows x64 PE，站点 1-5 全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
 
 - 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。站点 6 在 0.162.1 Linux 上是 1 处（`HTTP 429 retryability` 小节，`movw $0x0100`）；若该节报 `NOT FOUND`，裸 429 仍会一次不重试。站点 7 也是 1 处（`request_max_retries hard cap` 小节），带 `linked: result feeds max_attempts ...`；若该节报 `NOT FOUND`，`request_max_retries` 仍卡在 100。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
-- **离线回归测试**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接）。`python3 test_codex_linux.py` 用本地 mock 服务器对着**二进制副本**跑真 codex：站点 6 关→1 次请求、开→2 次；再打站点 7 并用 1ms 间隔跑 150 次重试，得到 151 次请求（未打则会在 101 停住）。二进制不存在、字面量不是恰好 1 处、或设 `CODEX_RETRY_SKIP_E2E=1` 时自动跳过 e2e，绝不碰已安装的二进制。
+- **内置自检**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接）。
 - **v0.156.1 → v0.159.1 变了什么**：两个 backoff 的结构判据没变（116 个 `from_millis` 尾部里仍恰好 2 处）。`retry.rs` 把 `Duration` 换成毫秒的 `imul * 1000` 挪到了尾部前 445 字节，超出原来的 320 字节抖动窗口，标签要单独回扫 1024 字节，否则两处都会被印成 `util.rs::backoff`。站点 4 从 2 处变成 4 处，多出来的两处 call 落在 `retry.rs::backoff` 里，验证通过就照打。
 - **v0.142.4 → v0.143.0 变了什么**（供下次排查参照）：
   1. 抖动 `random_range(0.9..1.1)` 的编译产物从「相邻 `0.9`/`1.1` 常量对」改成「下限 `0.9` + 区间宽度 `0.2`」，且 `0.9` 常量被两个 backoff 去重共享，旧的「相邻 0.9/1.1 对」定位失效。
@@ -256,7 +256,6 @@ $env:BUN_JSC_forceDebuggerBytecodeGeneration="1"
 ### 验证方式
 
 ```bash
-python3 test_claude_linux.py
 python3 claude-linux.py --dry-run
 # 可在原始二进制副本上验证打补丁与重复识别：
 cp <binary>.orig /tmp/claude.test
@@ -264,7 +263,7 @@ python3 claude-linux.py           --binary /tmp/claude.test
 python3 claude-linux.py --dry-run --binary /tmp/claude.test
 ```
 
-**Claude Code 2.1.306（本机 linux-x64 ELF）**：14 处站点全部命中，零警告、零跳过；等长改写及补丁后重复识别通过。离线回归覆盖改名、部分补丁、歧义、参数绑定错误，以及限流常量同名但不相关的声明。不以此声称已经验证真实 API 重试行为。
+**Claude Code 2.1.306（本机 linux-x64 ELF）**：14 处站点全部命中，零警告、零跳过；等长改写及补丁后重复识别通过。不以此声称已经验证真实 API 重试行为。
 
 ### 参数（两版通用）
 
@@ -312,12 +311,6 @@ python3 pi-linux.py --package ~/.npm-global/lib/node_modules/@earendil-works/pi-
 
 ```bash
 pi --session 01a10490-5593-70c4-812b-9ba8fa3840c7
-```
-
-离线回归检查：
-
-```bash
-python3 test_pi_linux.py
 ```
 
 ---
