@@ -2,7 +2,7 @@
 """
 Patch Codex CLI's retry backoff interval -- Linux/macOS build (ELF / Mach-O).
 
-Verified against codex 0.159.1 (x86_64-unknown-linux-musl). This is the
+Verified against codex 0.164.0 and 0.159.1 (x86_64-unknown-linux-musl). This is the
 Unix (ELF/Mach-O) build of the codex patcher; for the Windows PE build use
 codex-windows.py. The two jittered backoffs it targets are:
 
@@ -64,6 +64,12 @@ core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
      a look-alike Option<Duration> unwrap from ever being rewritten. On 0.159.1
      that accepts 4 sites: two call util.rs::backoff (the functions that also
      hold the site-5 ladder) and two call retry.rs::backoff.
+     In 0.164.0 the server delay is a deadline (Option<Instant>, None == -1),
+     with the opposite layout: `cmp r32,-1 ; je <backoff args/call>`. The Some
+     arm computes the remaining wait and skips the call (or returns). Rewrite
+     only that `je` to an unconditional jump, leaving error eligibility alone.
+     This form requires an ELF unwind-table-confirmed backoff entry, decoded
+     argument setup and a verified Some-arm exit; 16 sites match on 0.164.0.
 
   5. The `unbounded_connection_retries` ladder (Stable, default ON): on a
      ConnectionFailed the delay is a separate field that starts at
@@ -135,6 +141,7 @@ The retry interval and stream cap are fixed (RETRY_MS / STREAM_MAX_RETRIES).
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import platform
 import re
@@ -199,6 +206,13 @@ BACKOFF_FN_WINDOW = 0x600
 # and how far past the call the `jne` may land (the Some-path convergence).
 SITE4_CALL_WINDOW = 24
 SITE4_JOIN_WINDOW = 32
+# 0.164.0: `cmp r32,-1 ; [stack movs] ; je <backoff>` for Option<Instant>.
+# Keep this separate from the legacy Duration niche: changing only its constant
+# or accepting arbitrary branches would also match error-eligibility checks.
+SITE4_MOV_WINDOW = 24
+SITE4_SOME_WINDOW = 256
+SITE4_DEADLINE_CMP = re.compile(rb"[\x40\x41]?\x83[\xf8-\xff]\xff")
+MAX_RETRY_AFTER_SITES = 32
 
 # Site 5 circuit breaker: 0.159.1 still has exactly two connection ladders
 # (turn.rs sampling and compact_remote_v2.rs), each next to a site-4 caller of
@@ -354,6 +368,110 @@ def segment_maps(segs: list[tuple[int, int, int]]):
     return off2va, va2off
 
 
+def _elf_eh_frame_function_starts(data: bytes) -> list[int] | None:
+    """Validated .eh_frame_hdr function entry file offsets.
+
+    None means no supported index; [] means a recognized but malformed/empty
+    index (do not fall back to proximity matching in that case).
+    Deliberately supports only version=1, eh_frame_ptr=sdata4|pcrel,
+    fde_count=udata4, table=sdata4|datarel (01 1b 03 3b).
+    Relocations and ASLR are irrelevant: both indices are relative VAs.
+    """
+    if data[:4] != b"\x7fELF":
+        return None
+    if len(data) < 64:
+        return []
+    if data[4:7] != b"\x02\x01\x01":
+        return None
+    if struct.unpack_from("<H", data, 18)[0] != 62:
+        return None
+    if struct.unpack_from("<I", data, 20)[0] != 1:
+        return []
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    ehsize, phentsize, phnum = struct.unpack_from("<HHH", data, 52)
+    if ehsize != 64 or phentsize != 56 or phnum == 0xffff:
+        return []
+    if phoff > len(data) or phnum > (len(data) - phoff) // 56:
+        return []
+
+    loads = []
+    headers = []
+    for i in range(phnum):
+        typ, flags, off, va, _pa, filesz, memsz, _align = struct.unpack_from(
+            "<IIQQQQQQ", data, phoff + 56 * i)
+        if typ not in (1, 0x6474e550):
+            continue
+        if (filesz > memsz or off > len(data)
+                or filesz > len(data) - off or va + memsz > 1 << 64):
+            return []
+        if typ == 1:
+            loads.append((off, va, filesz, flags))
+        else:
+            headers.append((off, va, filesz))
+    if not headers:
+        return None
+    if len(headers) != 1:
+        return []
+
+    def va_to_off(va: int, size: int = 1, executable: bool = False):
+        matches = [off + va - start for off, start, length, flags in loads
+                   if start <= va and size <= length
+                   and va - start <= length - size
+                   and (not executable or flags & 1)]
+        # Ambiguous PT_LOAD mappings are refused rather than guessed.
+        return matches[0] if len(matches) == 1 else None
+
+    hdr, hdr_va, hdr_size = headers[0]
+    if hdr_size < 12 or va_to_off(hdr_va, hdr_size) != hdr:
+        return []
+    if data[hdr:hdr + 4] != b"\x01\x1b\x03\x3b":
+        return None
+    eh_va = hdr_va + 4 + struct.unpack_from("<i", data, hdr + 4)[0]
+    if va_to_off(eh_va, 4) is None:
+        return []
+    count = struct.unpack_from("<I", data, hdr + 8)[0]
+    if count > (hdr_size - 12) // 8:
+        return []
+    starts = []
+    prior_va = -1
+    prior_off = -1
+    for i in range(count):
+        start_delta, fde_delta = struct.unpack_from("<ii", data, hdr + 12 + 8 * i)
+        start_va = hdr_va + start_delta
+        fde_va = hdr_va + fde_delta
+        start_off = va_to_off(start_va, executable=True)
+        if (start_off is None or va_to_off(fde_va, 4) is None
+                or start_va <= prior_va or start_off <= prior_off):
+            return []
+        starts.append(start_off)
+        prior_va, prior_off = start_va, start_off
+    return starts
+
+
+def elf_backoff_entries(data: bytes, jitter_sites: list[dict],
+                        window: int = BACKOFF_FN_WINDOW) -> set[int] | None:
+    """Restrict target to the index entry preceding a found jitter region.
+
+    The index's next start is an upper bound, not the decoded FDE end.
+    This does not establish a general CFG proof: keep the window and all
+    call-site / branch / dataflow checks. Last unbounded index entry is
+    conservatively excluded. region_end, if present, must also fit.
+    """
+    starts = _elf_eh_frame_function_starts(data)
+    if starts is None:
+        return None
+    entries = set()
+    for site in jitter_sites:
+        region = site["region_start"]
+        end = site.get("region_end", region + 1)
+        i = bisect.bisect_right(starts, region) - 1
+        if (0 <= i < len(starts) - 1 and window > 0
+                and starts[i] <= region < starts[i] + window
+                and region < end <= starts[i + 1]):
+            entries.add(starts[i])
+    return entries
+
+
 # ── Sites 1 & 2: in-place jitter -> fixed interval ────────────────────────────
 def _f64_at(data: bytes, off: int):
     """The f64 stored at `off`, or None if `off` is not a full 8 bytes inside the
@@ -498,6 +616,8 @@ def _call_target_off(data: bytes, off: int, off2va, va2off):
 
     Handles `e8 rel32` (direct) and `ff 15 disp32` (indirect through a GOT slot,
     which is what this build emits for cross-codegen-unit calls)."""
+    if _call_len(data, off) is None:
+        return None
     va = off2va(off)
     if va is None:
         return None
@@ -506,16 +626,18 @@ def _call_target_off(data: bytes, off: int, off2va, va2off):
         return va2off(target)
     if data[off] == 0xFF and data[off + 1] == 0x15:
         slot = va2off(va + 6 + struct.unpack_from("<i", data, off + 2)[0])
-        if slot is None or slot + 8 > len(data):
+        if slot is None or slot < 0 or slot + 8 > len(data):
             return None
         return va2off(struct.unpack_from("<Q", data, slot)[0])
     return None
 
 
 def _call_len(data: bytes, off: int):
-    if data[off] == 0xE8:
+    if off < 0 or off >= len(data):
+        return None
+    if data[off] == 0xE8 and off + 5 <= len(data):
         return 5
-    if data[off] == 0xFF and data[off + 1] == 0x15:
+    if data[off:off + 2] == b"\xff\x15" and off + 6 <= len(data):
         return 6
     return None
 
@@ -534,20 +656,25 @@ def _backoff_call_after(data: bytes, start: int, in_backoff, limit: int):
 
 
 def find_retry_after_sites(data: bytes, jitter_sites: list[dict],
-                           off2va, va2off) -> list[dict]:
-    """Offsets of `server_retry_delay.unwrap_or_else(|| backoff(n))`.
+                           off2va, va2off, *,
+                           backoff_entries: set[int] | None = None) -> list[dict]:
+    """Verified server-delay/backoff selections, in legacy and deadline layouts.
 
-        cmp  <r32>, 0x3b9aca00   ; Option<Duration> niche: 1e9 == None
-        jne  <past the backoff call>
-        ...  arg setup ...
-        call <core::util::backoff>
+    Legacy: cmp r32,1e9 ; jne <past backoff call> -> NOP the jne.
+    0.164:  cmp r32,-1 ; je <backoff args/call>   -> make the je unconditional.
 
-    A site is accepted only when the call target encloses one of the jitter sites
-    patched by sites 1-2, i.e. it provably is `backoff`. That check -- not the
-    byte pattern -- is what makes NOP-ing the `jne` safe."""
-    entries = [s["region_start"] for s in jitter_sites]
-    in_backoff = (lambda p: any(p <= r < p + BACKOFF_FN_WINDOW for r in entries),
-                  off2va, va2off)
+    On ELF, constrain calls to the unwind-table entry containing a jitter site,
+    not merely any function within BACKOFF_FN_WINDOW before it. New deadline
+    sites require this stronger check; the legacy matcher retains its previous
+    fallback for images without a supported ELF unwind table (e.g. Mach-O).
+    Explicit entries are useful for synthetic tests with identity VA maps.
+    """
+    if backoff_entries is None:
+        backoff_entries = elf_backoff_entries(data, jitter_sites)
+    regions = [s["region_start"] for s in jitter_sites]
+    is_backoff = (lambda p: p in backoff_entries) if backoff_entries is not None else (
+        lambda p: any(p <= r < p + BACKOFF_FN_WINDOW for r in regions))
+    in_backoff = (is_backoff, off2va, va2off)
     out: list[dict] = []
     i = data.find(NICHE_NONE)
     while i != -1:
@@ -562,13 +689,18 @@ def find_retry_after_sites(data: bytes, jitter_sites: list[dict],
             if site is not None:
                 out.append(site)
         i = data.find(NICHE_NONE, i + 1)
-    return out
+    if backoff_entries:
+        out.extend(_find_deadline_retry_after_sites(
+            data, in_backoff, _elf_eh_frame_function_starts(data)))
+    return sorted(out, key=lambda s: s["branch"])
 
 
 def _classify_retry_after(data: bytes, cmp_off: int, after_cmp: int, reg: int,
                           in_backoff) -> dict | None:
     """Match the `jne`-or-already-NOPed form at `after_cmp`; None if neither."""
     for length, patched in ((2, False), (6, False), (2, True), (6, True)):
+        if after_cmp + length > len(data):
+            continue
         blob = data[after_cmp : after_cmp + length]
         if patched:
             if blob != NOP_RUNS[length]:
@@ -591,9 +723,208 @@ def _classify_retry_after(data: bytes, cmp_off: int, after_cmp: int, reg: int,
         # The branch must jump *over* the backoff call and rejoin just past it.
         if join is not None and not (call_end <= join <= call_end + SITE4_JOIN_WINDOW):
             continue
-        return {"cmp": cmp_off, "reg": reg, "jne": after_cmp, "len": length,
-                "call": call_off, "patched": patched}
+        return {"cmp": cmp_off, "reg": reg, "branch": after_cmp, "len": length,
+                "call": call_off, "patched": patched, "condition": "jne",
+                "none": 1_000_000_000, "patch": NOP_RUNS[length]}
     return None
+
+
+def _stack_mov_end(data: bytes, off: int):
+    """End of a flag-preserving r64 <-> [rsp+disp8/32] MOV, or None.
+
+    0.164 schedules up to three such spills/reloads between cmp and je. Do not
+    scan blindly across arbitrary instructions: an intervening flag writer
+    would make that je test something other than the server-delay niche.
+    """
+    if off + 4 > len(data) or data[off] not in (0x48, 0x4C):
+        return None
+    if data[off + 1] not in (0x89, 0x8B) or data[off + 3] != 0x24:
+        return None
+    modrm = data[off + 2]
+    if (modrm & 0xC7) not in (0x44, 0x84):
+        return None
+    end = off + (5 if modrm >> 6 == 1 else 8)
+    return end if end <= len(data) else None
+
+
+def _backoff_arg_end(data: bytes, off: int):
+    """Decode one MOV/load/immediate or self-XOR setting rdi/rsi/rdx.
+
+    These are the System V backoff arguments. Reject branches, stores, calls
+    and unknown instructions instead of searching for call bytes inside them.
+    """
+    if off >= len(data):
+        return None
+    rex, j = 0, off
+    if 0x40 <= data[j] <= 0x4F:
+        rex, j = data[j], j + 1
+    if j >= len(data):
+        return None
+    op = data[j]
+    args = (2, 6, 7)
+    if 0xB8 <= op <= 0xBF and not rex & 8:
+        reg = (op & 7) | ((rex & 1) << 3)
+        return j + 5 if reg in args and j + 5 <= len(data) else None
+    if j + 1 >= len(data):
+        return None
+    modrm = data[j + 1]
+    reg = ((modrm >> 3) & 7) | (((rex >> 2) & 1) << 3)
+    rm = (modrm & 7) | ((rex & 1) << 3)
+    if modrm >> 6 == 3:
+        if ((op == 0x89 and rm in args) or (op == 0x8B and reg in args)
+                or (op == 0x31 and rm == reg and rm in args)):
+            return j + 2
+    elif op == 0x8B and reg in args:
+        mem = _mem_operand(data, j + 1, rex)
+        if mem is not None:
+            return mem["end"]
+    return None
+
+
+def _deadline_backoff_call(data: bytes, start: int, in_backoff):
+    """Walk only argument setup, ending at a verified backoff call."""
+    i = start
+    while i < min(start + SITE4_CALL_WINDOW, len(data)):
+        n = _call_len(data, i)
+        if n is not None:
+            target = _call_target_off(data, i, *in_backoff[1:])
+            return (i, n) if target is not None and in_backoff[0](target) else None
+        end = _backoff_arg_end(data, i)
+        if end is None:
+            return None
+        i = end
+    return None
+
+
+def _rsp_operand(data: bytes, off: int, reg: int):
+    """Plain [rsp+disp8/32] ModR/M+SIB operand with a specified reg field."""
+    if off + 3 > len(data) or data[off + 1] != 0x24:
+        return None
+    mod, low = data[off] >> 6, data[off] & 0x3F
+    if mod not in (1, 2) or low != ((reg << 3) | 4):
+        return None
+    end = off + (3 if mod == 1 else 6)
+    if end > len(data):
+        return None
+    return end, int.from_bytes(data[off + 2:end], "little", signed=True)
+
+
+def _remaining_delay_end(data: bytes, off: int):
+    """End of the Option<remaining Duration> tail selecting rax/edx.
+
+    xor eax,eax ; cmp byte[rsp+D],0 ; mov edx,[rsp+D+16] ;
+    cmovne edx,eax ; cmove rax,[rsp+D+8]. All relative stack slots must agree.
+    """
+    if data[off:off + 3] != b"\x31\xc0\x80":
+        return None
+    flag = _rsp_operand(data, off + 3, 7)
+    if flag is None:
+        return None
+    i, disp = flag
+    if data[i:i + 2] != b"\x00\x8b":
+        return None
+    nanos = _rsp_operand(data, i + 2, 2)
+    if nanos is None or nanos[1] != disp + 16:
+        return None
+    i = nanos[0]
+    if data[i:i + 6] != b"\x0f\x45\xd0\x48\x0f\x44":
+        return None
+    secs = _rsp_operand(data, i + 6, 0)
+    return secs[0] if secs is not None and secs[1] == disp + 8 else None
+
+
+def _some_delay_tail_ok(data: bytes, some: int, exit_off: int) -> bool:
+    # A precomputed delay can be a single stack reload followed by the jump.
+    if data[some:some + 2] == b"\x48\x8b":
+        secs = _rsp_operand(data, some + 2, 0)
+        if secs is not None and secs[0] == exit_off:
+            return True
+    # Otherwise require the decoded remaining-delay result, not raw EB/E9
+    # bytes that might occur inside an immediate or memory displacement.
+    return any(_remaining_delay_end(data, off) == exit_off
+               for off in range(max(some, exit_off - 40), exit_off))
+
+
+def _some_arm_skips_backoff(data: bytes, some: int, backoff: int, call_end: int,
+                            caller_end: int) -> bool:
+    """Some must jump past the call, or return with the same stack epilogue.
+
+    The second form is the shared CodexErr::retry_delay function. Do NOT touch
+    its separate error-kind checks or the no-fallback RetryLimit arm.
+    """
+    for length, opcode in ((2, 0xEB), (5, 0xE9)):
+        off = backoff - length
+        if off >= some and data[off] == opcode:
+            join = backoff + int.from_bytes(data[off + 1:backoff],
+                                            "little", signed=True)
+            if (call_end <= join <= call_end + SITE4_JOIN_WINDOW and join < caller_end
+                    and _some_delay_tail_ok(data, some, off)):
+                return True
+    epilogue = data[backoff - 5:backoff]
+    return (backoff - 5 >= some and len(epilogue) == 5
+            and epilogue[:3] == b"\x48\x83\xc4" and 0 < epilogue[3] < 0x80
+            and epilogue[4] == 0xC3 and call_end + 5 <= caller_end
+            and data[call_end:call_end + 5] == epilogue
+            and _some_delay_tail_ok(data, some, backoff - 5))
+
+
+def _find_deadline_retry_after_sites(data: bytes, in_backoff,
+                                    function_starts: list[int] | None = None) -> list[dict]:
+    """0.164 Option<Instant> None (-1): force the existing backoff arm.
+
+    JE rel8 becomes JMP rel8; JE rel32 becomes NOP + JMP rel32. The latter
+    keeps the same instruction end, so its relative displacement is unchanged.
+    Both patched forms retain enough structure for an idempotent re-read.
+    """
+    out = []
+    for m in SITE4_DEADLINE_CMP.finditer(data):
+        cmp_off, after_cmp = m.span()
+        # Never accept the middle of a 16/64-bit compare as a 32-bit niche test.
+        if cmp_off and (0x40 <= data[cmp_off - 1] <= 0x4F
+                        or data[cmp_off - 1] == 0x66):
+            continue
+        reg = (data[after_cmp - 2] & 7) | (8 if data[cmp_off] == 0x41 else 0)
+        branch = after_cmp
+        while True:
+            end = _stack_mov_end(data, branch)
+            if end is None or end > after_cmp + SITE4_MOV_WINDOW:
+                break
+            branch = end
+        head = data[branch:branch + 2]
+        if head[:1] in (b"\x74", b"\xeb"):
+            length, patched = 2, head[:1] == b"\xeb"
+            disp_off = branch + 1
+            prefix = b"\xeb"
+        elif head in (b"\x0f\x84", b"\x90\xe9"):
+            length, patched = 6, head == b"\x90\xe9"
+            disp_off = branch + 2
+            prefix = b"\x90\xe9"
+        else:
+            continue
+        some = branch + length
+        if some > len(data):
+            continue
+        disp = data[disp_off:some]
+        backoff = some + int.from_bytes(disp, "little", signed=True)
+        if not (some < backoff <= min(some + SITE4_SOME_WINDOW, len(data) - 1)):
+            continue
+        found = _deadline_backoff_call(data, backoff, in_backoff)
+        if found is None:
+            continue
+        call, call_len = found
+        caller_end = len(data)
+        if function_starts is not None:
+            caller = bisect.bisect_right(function_starts, cmp_off) - 1
+            if not (0 <= caller < len(function_starts) - 1
+                    and call + call_len < function_starts[caller + 1]):
+                continue
+            caller_end = function_starts[caller + 1]
+        if not _some_arm_skips_backoff(data, some, backoff, call + call_len, caller_end):
+            continue
+        out.append({"cmp": cmp_off, "reg": reg, "branch": branch, "len": length,
+                    "call": call, "patched": patched, "condition": "je",
+                    "none": 0xFFFF_FFFF, "patch": prefix + disp})
+    return out
 
 
 # ── Site 5 (unbounded connection-retry ladder: 5s doubling to 60s) ────────────
@@ -1260,25 +1591,37 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
 
     # -- Site 4: Retry-After outranking the fixed backoff ---------------------
     print()
-    print("=== Retry-After override (CodexErr::retry_delay unwrap_or_else) ===")
+    print("=== Retry-After override (server delay vs backoff) ===")
     off2va, va2off = segment_maps(load_segments(bytes(data), fmt))
     ra_sites = find_retry_after_sites(bytes(data), [s for _, s in report],
                                       off2va, va2off)
+    if len(ra_sites) > MAX_RETRY_AFTER_SITES:
+        print(f"  {len(ra_sites)} site(s) matched but at most {MAX_RETRY_AFTER_SITES} "
+              "are plausible - REFUSING to patch site 4 (signature went loose)")
+        ra_sites = []
     for idx, s in enumerate(ra_sites, 1):
-        state = "already NOPed" if s["patched"] else "live"
-        print(f"  [{idx}] cmp {reg_name(s['reg'])},0x3b9aca00 @ 0x{s['cmp']:x}"
-              f"  (Option<Duration> None niche)")
-        print(f"        branch  : {s['len']}-byte jne @ 0x{s['jne']:x} -> {state}")
-        print(f"        verified: call @ 0x{s['call']:x} lands in a patched "
-              f"backoff")
-        print(f"        rewrite : jne -> {s['len']}-byte NOP "
+        deadline = s["condition"] == "je"
+        state = ("already unconditional" if deadline else "already NOPed") \
+            if s["patched"] else "live"
+        niche = "Option<Instant>" if deadline else "Option<Duration>"
+        print(f"  [{idx}] cmp {reg_name(s['reg'])},0x{s['none']:x} @ 0x{s['cmp']:x}"
+              f"  ({niche} None niche)")
+        print(f"        branch  : {s['len']}-byte {s['condition']} "
+              f"@ 0x{s['branch']:x} -> {state}")
+        print(f"        verified: call @ 0x{s['call']:x} lands in a patched backoff")
+        if deadline:
+            target = _call_target_off(data, s["call"], off2va, va2off)
+            print(f"        entry   : ELF unwind table confirms 0x{target:x}; "
+                  "Some arm skips the call")
+        rewrite = "je -> unconditional jmp" if deadline else f"jne -> {s['len']}-byte NOP"
+        print(f"        rewrite : {rewrite} "
               f"(server Retry-After ignored, backoff always wins)")
     if not ra_sites:
-        print("  NOT FOUND - skipping (a server Retry-After will still override "
+        print("  NOT FOUND - skipping (a server Retry-After may still override "
               f"the {ms}ms interval)")
     for s in ra_sites:
         if not s["patched"]:
-            edits.append((s["jne"], NOP_RUNS[s["len"]]))
+            edits.append((s["branch"], s["patch"]))
 
     # -- Site 5: unbounded connection-retry ladder (5s -> 60s) ----------------
     secs = conn_delay_secs(ms)
@@ -1363,7 +1706,8 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     print("=== Summary ===")
     print(f"  jitter sites : {len(report)} to patch -> {ms}ms fixed interval")
     print(f"  stream cap   : {len(cap_sites)} site(s) -> {max_retries}")
-    print(f"  retry-after  : {len(ra_sites)} site(s) -> ignored")
+    ra_status = "ignored at matched sites" if ra_sites else "NOT PATCHED (server delay may win)"
+    print(f"  retry-after  : {len(ra_sites)} site(s) -> {ra_status}")
     print(f"  conn ladder  : {len(conn_sites)} site(s) -> {secs}s flat")
     print(f"  retry 429    : {len(ra429_sites)} site(s) -> retryable")
     print(f"  request cap  : {len(req_sites)} site(s) -> {REQUEST_MAX_RETRIES}")
@@ -1486,7 +1830,9 @@ def self_test() -> None:
     outside[out_at:out_at + 7] = b"\x48\x69\xc0\xe8\x03\x00\x00"
     assert jitter_label(bytes(outside), {"region_end": end}) == "util.rs::backoff"
     _self_test_site3()
+    _self_test_elf_entries()
     _self_test_site4()
+    _self_test_site4_deadline()
     _self_test_site5()
     _self_test_site6()
     _self_test_site7()
@@ -1525,6 +1871,62 @@ def _self_test_site3() -> None:
     assert find_stream_cap_sites(b"\x00" * at + STREAM_CAP_MID + b"\x00" * 0x20) == []
 
 
+def _elf_unwind_fixture() -> bytearray:
+    """Three PT_LOADs with distinct VA/file skews; header in the third."""
+    data = bytearray(0x1000)
+    data[:16] = b"\x7fELF\x02\x01\x01" + b"\0" * 9
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16,
+                     3, 62, 1, 0x200000, 64, 0, 0, 64, 56, 4, 0, 0, 0)
+    phdrs = [(1, 4, 0, 0x100000, 0, 0x400, 0x400, 0x1000),
+             (1, 5, 0x400, 0x200000, 0, 0x400, 0x400, 0x1000),
+             (1, 4, 0x800, 0x300000, 0, 0x800, 0x800, 0x1000),
+             (0x6474e550, 4, 0x800, 0x300000, 0, 36, 36, 4)]
+    for i, fields in enumerate(phdrs):
+        struct.pack_into("<IIQQQQQQ", data, 64 + i * 56, *fields)
+    data[0x800:0x804] = b"\x01\x1b\x03\x3b"
+    struct.pack_into("<iI", data, 0x804, 0x300100 - 0x300004, 3)
+    for i, va in enumerate((0x200000, 0x200100, 0x200200)):
+        struct.pack_into("<ii", data, 0x80c + i * 8,
+                         va - 0x300000, 0x300100 + 16 * i - 0x300000)
+    return data
+
+
+def _self_test_elf_entries() -> None:
+    d = _elf_unwind_fixture()
+    assert _elf_eh_frame_function_starts(d) == [0x400, 0x500, 0x600]
+    s = [{"region_start": 0x520, "region_end": 0x550}]
+    assert elf_backoff_entries(d, s) == {0x500}
+    assert 0x400 not in elf_backoff_entries(d, s)  # old window falsely accepts
+    assert elf_backoff_entries(d, s, window=0x20) == set()  # strict boundary
+    assert elf_backoff_entries(d, s, window=0x21) == {0x500}
+    assert elf_backoff_entries(d, [{"region_start": 0x500}]) == {0x500}
+    assert elf_backoff_entries(d, [{"region_start": 0x3ff}]) == set()
+    assert elf_backoff_entries(d, [{"region_start": 0x650}]) == set()
+    assert elf_backoff_entries(d, [{"region_start": 0x520,
+                                   "region_end": 0x601}]) == set()
+    assert elf_backoff_entries(d, []) == set()
+    assert elf_backoff_entries(b"MachO", s) is None
+    assert elf_backoff_entries(b"\x7fELF", s) == set()
+    bad = bytearray(d); bad[0x800] = 2
+    assert elf_backoff_entries(bad, s) is None  # unsupported != successful empty
+    bad = bytearray(d); struct.pack_into("<I", bad, 64 + 3 * 56, 0)
+    assert elf_backoff_entries(bad, s) is None  # no PT_GNU_EH_FRAME
+    bad = bytearray(d); struct.pack_into("<I", bad, 0x808, 0xffffffff)
+    assert elf_backoff_entries(bad, s) == set()  # oversized count
+    bad = bytearray(d); struct.pack_into("<I", bad, 0x808, 0)
+    assert elf_backoff_entries(bad, s) == set()  # valid zero count
+    bad = bytearray(d); bad[0x814:0x81c] = bad[0x80c:0x814]
+    assert elf_backoff_entries(bad, s) == set()  # duplicate starts
+    bad = bytearray(d); struct.pack_into("<i", bad, 0x814, 0x1fffff-0x300000)
+    assert elf_backoff_entries(bad, s) == set()  # unsorted/nonexecutecutable
+    bad = bytearray(d); struct.pack_into("<i", bad, 0x810, 0x7fffffff)
+    assert elf_backoff_entries(bad, s) == set()  # unmapped FDE pointer
+    bad = bytearray(d); struct.pack_into("<Q", bad, 32, len(d) - 1)
+    assert elf_backoff_entries(bad, s) == set()  # truncated phdr table
+    bad = bytearray(d); struct.pack_into("<I", bad, 64 + 56 + 4, 4)
+    assert elf_backoff_entries(bad, s) == set()  # entry not in executable load
+
+
 def _self_test_site4() -> None:
     """Synthetic `err.retry_delay().unwrap_or_else(|| backoff(n))` branch:
         cmp ecx,1e9 ; jne +0x0b ; mov rdi,rcx ; call F ; <3B join pad>
@@ -1543,7 +1945,7 @@ def _self_test_site4() -> None:
     sites = find_retry_after_sites(bytes(blob), jitter, ident, ident)
     assert len(sites) == 1, sites
     s = sites[0]
-    assert (s["cmp"], s["jne"], s["len"], s["reg"]) == (C, C + 6, 2, 1), s
+    assert (s["cmp"], s["branch"], s["len"], s["reg"]) == (C, C + 6, 2, 1), s
     assert s["patched"] is False and s["call"] == C + 11
     # a call that does not land in a patched backoff must be rejected outright
     far = bytearray(blob)
@@ -1564,9 +1966,151 @@ def _self_test_site4() -> None:
     assert via_got[0]["call"] == C + 11 and via_got[0]["patched"] is False
     # apply and confirm the NOPed form is still recognized (idempotency)
     patched = bytearray(blob)
-    patched[s["jne"] : s["jne"] + 2] = NOP_RUNS[2]
+    patched[s["branch"] : s["branch"] + 2] = s["patch"]
     again = find_retry_after_sites(bytes(patched), jitter, ident, ident)
     assert len(again) == 1 and again[0]["patched"] is True, again
+    # Keep the older six-byte JNE and accumulator cmp forms working too.
+    for cmp in (b"\x81\xf9" + NICHE_NONE, b"\x3d" + NICHE_NONE):
+        long = bytearray(b"\x90" * 0x600)
+        branch = C + len(cmp)
+        call = branch + 6 + 3
+        body = (cmp + b"\x0f\x85" + struct.pack("<i", 11)
+                + b"\x48\x89\xcf" + b"\xe8" + struct.pack("<i", F - (call + 5)))
+        long[C:C + len(body)] = body
+        sites = find_retry_after_sites(bytes(long), jitter, ident, ident)
+        assert len(sites) == 1 and sites[0]["len"] == 6 and not sites[0]["patched"]
+        long[branch:branch + 6] = sites[0]["patch"]
+        assert find_retry_after_sites(bytes(long), jitter, ident, ident)[0]["patched"]
+        assert find_retry_after_sites(bytes(long), jitter, ident, ident,
+                                      backoff_entries={F - 0x10}) == []
+
+
+def _self_test_site4_deadline() -> None:
+    """0.164 deadline branches: both jump sizes, spills, CFG and idempotency."""
+    ident = lambda x: x
+    C, F, G = 0x80, 0x300, 0x500
+    jitter = [{"region_start": F + 0x20, "region_end": F + 0x40}]
+    result = bytes.fromhex("31c0 807c242000 8b542430 0f45d0 480f44442428")
+    epilogue = bytes.fromhex("4883c438 c3")
+    spills = (bytes.fromhex("4889842450010000 48894c2418 4c897c2450"),
+              bytes.fromhex("488b6c2408"))
+
+    def build(*, long=False, gap=b"", cmp=b"\x83\xf9\xff",
+              returns=False, copy=False, got=False, long_exit=False):
+        d = bytearray(b"\x90" * 0x700)
+        branch = C + len(cmp) + len(gap)
+        length = 6 if long else 2
+        some = branch + length
+        body = bytes.fromhex("488b442470") if copy else b"\xe8\x00\x00\x00\x00" + result
+        exit_len = 5 if returns or long_exit else 2
+        target = some + len(body) + exit_len
+        args = bytes.fromhex("4889f7") if returns else bytes.fromhex("488b7b40 8b7348 4c89fa")
+        call = target + len(args)
+        call_len = 6 if got else 5
+        join = call + call_len
+        if returns:
+            exit_code = epilogue
+        elif long_exit:
+            exit_code = b"\xe9" + struct.pack("<i", join - target)
+        else:
+            exit_code = b"\xeb" + struct.pack("<b", join - target)
+        branch_code = (b"\x0f\x84" + struct.pack("<i", target - some)) if long else (
+            b"\x74" + struct.pack("<b", target - some))
+        call_code = (b"\xff\x15" + struct.pack("<i", G - join)) if got else (
+            b"\xe8" + struct.pack("<i", F - join))
+        code = cmp + gap + branch_code + body + exit_code + args + call_code
+        if returns:
+            code += epilogue
+        d[C:C + len(code)] = code
+        struct.pack_into("<Q", d, G, F)
+        return d, branch, length, some, target, call
+
+    def find(d, entries=(F,)):
+        return find_retry_after_sites(bytes(d), jitter, ident, ident,
+                                      backoff_entries=set(entries))
+
+    cases = ({}, {"long": True}, {"gap": spills[0]}, {"gap": spills[1]},
+             {"returns": True}, {"got": True}, {"copy": True},
+             {"long_exit": True}, {"long": True, "got": True, "gap": spills[0]},
+             {"cmp": b"\x41\x83\xf9\xff"})
+    for case in cases:
+        d, branch, length, some, target, call = build(**case)
+        sites = find(d)
+        assert len(sites) == 1, (case, sites)
+        s = sites[0]
+        assert (s["cmp"], s["branch"], s["len"], s["call"]) == (C, branch, length, call)
+        assert s["reg"] == (9 if case.get("cmp") else 1) and not s["patched"]
+        patch = s["patch"]
+        assert len(patch) == length
+        assert (patch[:1] == b"\xeb" if length == 2 else patch[:2] == b"\x90\xe9")
+        disp = patch[1:] if length == 2 else patch[2:]
+        assert some + int.from_bytes(disp, "little", signed=True) == target
+        done = bytearray(d)
+        done[branch:some] = patch
+        assert len(done) == len(d) and done[:branch] == d[:branch] and done[some:] == d[some:]
+        again = find(done)
+        assert len(again) == 1 and again[0]["patched"] and again[0]["patch"] == patch
+        assert find(d, {F - 0x10}) == []  # nearby but wrong function
+        assert find(d, set()) == []
+        assert find_retry_after_sites(bytes(d), jitter, ident, ident) == []  # no unwind proof
+
+    for case in ({"gap": b"\x31\xc0"},             # clobbers comparison flags
+                 {"gap": bytes.fromhex("488b6d08")},  # not a stack MOV
+                 {"gap": spills[0] * 2},              # over the allowed gap
+                 {"cmp": b"\x48\x83\xf9\xff"},   # 64-bit, not a niche
+                 {"cmp": b"\x66\x83\xf9\xff"}):  # 16-bit
+        assert find(build(**case)[0]) == [], case
+
+    d, branch, length, some, target, call = build()
+    bad = bytearray(d); bad[some + 5 + 10] ^= 1  # nanos slot no longer D+16
+    assert find(bad) == []
+    bad = bytearray(d); bad[target - 1] = 0      # Some jump no longer skips call
+    assert find(bad) == []
+    bad = bytearray(d); bad[target:target + 2] = b"\xeb\x00"  # branch, not args
+    assert find(bad) == []
+    bad = bytearray(d); bad[target:target + 3] = b"\x48\x89\x07"  # store, not args
+    assert find(bad) == []
+    bad = bytearray(d); struct.pack_into("<i", bad, call + 1, F - 0x10 - (call + 5))
+    assert find(bad) == []  # the old proximity check would accept this callee
+    bad = bytearray(d); bad[branch + 1] = 0xFE  # backward branch
+    assert find(bad) == []
+    # EB-like bytes inside a movabs immediate are not a Some-arm terminator.
+    bad = bytearray(d)
+    fake = b"\x48\xb8" + b"\x00" * 6 + d[target - 2:target]
+    bad[some:target] = b"\x90" * (target - some - len(fake)) + fake
+    assert find(bad) == []
+    # Both epilogues must balance the same stack allocation.
+    d, branch, length, some, target, call = build(returns=True)
+    bad = bytearray(d); bad[call + 5 + 3] = 0x28
+    assert find(bad) == []
+    # Crossing indexed caller boundaries is refused, even with a valid callee.
+    assert _find_deadline_retry_after_sites(bytes(d), (lambda p: p == F, ident, ident),
+                                            [C, target, F, G]) == []
+    # Truncated instructions do not raise or match.
+    for end in range(len(d[C:call + 5])):
+        assert find(d[:C + end]) == []
+    assert _call_len(b"\xe8", 0) is None
+    assert _call_len(b"\xff\x15", 0) is None
+    assert _call_len(b"", 0) is None
+    assert _call_len(b"\x90", -1) is None
+    assert _call_target_off(b"\xff\x15\xf9\xff\xff\xff", 0, ident, ident) is None
+    # Integration: real ELF headers, nonidentity VA maps and automatic entry
+    # discovery must authorize only the containing backoff, not its neighbor.
+    d, branch, length, some, target, call = build()
+    elf = _elf_unwind_fixture()
+    at, callee = 0x420, 0x500
+    elf[at:at + call + 5 - C] = d[C:call + 5]
+    rebased_call = at + call - C
+    struct.pack_into("<i", elf, rebased_call + 1, callee - (rebased_call + 5))
+    maps = segment_maps(load_segments(elf, "elf"))
+    real_jitter = [{"region_start": callee + 0x20, "region_end": callee + 0x40}]
+    sites = find_retry_after_sites(bytes(elf), real_jitter, *maps)
+    assert len(sites) == 1 and sites[0]["branch"] == at + branch - C
+    bad = bytearray(elf)
+    struct.pack_into("<i", bad, rebased_call + 1, 0x400 - (rebased_call + 5))
+    assert find_retry_after_sites(bytes(bad), real_jitter, *maps) == []
+    bad = bytearray(elf); bad[0x800] = 2  # unsupported unwind encoding cannot authorize new form
+    assert find_retry_after_sites(bytes(bad), real_jitter, *maps) == []
 
 
 def _self_test_site5() -> None:
