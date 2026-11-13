@@ -4,7 +4,8 @@ Patch Codex CLI's retry backoff interval -- Linux/macOS build (ELF / Mach-O).
 
 Verified against codex 0.164.0 and 0.159.1 (x86_64-unknown-linux-musl). This is the
 Unix (ELF/Mach-O) build of the codex patcher; for the Windows PE build use
-codex-windows.py. The two jittered backoffs it targets are:
+codex-windows.py. Dry-run validation also covers codex 0.167.2 on Linux x64.
+The two jittered backoffs it targets are:
 
   1. codex-client/src/retry.rs::backoff(base, attempt)  -- generic retry path
        `sleep(backoff(policy.base_delay, attempt+1))`.
@@ -105,6 +106,13 @@ core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
      (NOP-padded), i.e. a true `.min(9999)`. It is accepted only when `res` is
      the register the site-6 literal loads `max_attempts` from, which is what
      separates it from the many unrelated `.min(100)` shapes in the image.
+     In 0.167.2 the Option discriminant is compared in memory instead:
+         mov <val>,[<option>+8] ; cmp/mov/cmovb <clamp>
+         cmp byte[<option>],0 ; mov <saved>,<option>
+         mov <res>,<default> ; cmovne <res>,<acc>
+     The value load and flag comparison must address the same Option, and
+     only one flag-preserving register MOV may intervene without overwriting
+     the accumulator. The rewrite still changes only the clamp's 13/14 bytes.
 
 DESIGN RULE -- this patcher only ever changes "how long to wait after a failure
 has already been declared". It must never change what counts as a failure, nor
@@ -253,9 +261,9 @@ MAX_RETRY_429_SITES = 1
 
 # Site 7: the `request_max_retries().min(MAX_REQUEST_MAX_RETRIES)` clamp, which
 # has its own shape in the same function as the site-6 literal. The Option
-# discriminant is already in a register here (site 3's form compares it in
-# memory), so a site is confirmed by linking its result register to the
-# `max_attempts` slot of that literal, not by a fixed byte pattern.
+# discriminant can be in a register or memory (0.167.2). Confirm a site by
+# linking its result register to the literal's `max_attempts` slot, not by
+# a fixed byte pattern.
 REQUEST_CAP_WINDOW = 0x800   # how far the clamp may sit from the site-6 literal
 
 # 32-bit GP register names by 4-bit register number (for readable logs).
@@ -1259,7 +1267,7 @@ def _r64_store_before(data: bytes, start: int, base: int, disp: int):
     return None
 
 
-# ── Site 7: request_max_retries hard cap (site 3's idea, register form) ──────
+# ── Site 7: request_max_retries hard cap (register/memory Option forms) ─────
 def _dec_mov_r32_imm(data: bytes, off: int):
     """`mov r32, imm32` (`b8+rd`, optional REX.B prefix) -> (reg, imm, end)."""
     j = off
@@ -1309,15 +1317,91 @@ def _dec_cmov(data: bytes, off: int, opcode: int):
             (modrm & 7) | ((rex & 1) << 3), off + 4)
 
 
+def _dec_cmp_mem8_zero(data: bytes, off: int):
+    """`cmp byte [base+disp],0` (80 /7), with a plain memory operand."""
+    j, rex = off, 0
+    if j < len(data) and data[j] in (0x40, 0x41):
+        rex, j = data[j], j + 1
+    if j + 1 >= len(data) or data[j] != 0x80:
+        return None
+    if ((data[j + 1] >> 3) & 7) != 7:
+        return None
+    mem = _mem_operand(data, j + 1, rex)
+    if mem is None or mem["end"] >= len(data) or data[mem["end"]] != 0:
+        return None
+    return {"base": mem["base"], "disp": mem["disp"], "end": mem["end"] + 1}
+
+
+def _decode_request_cap_tail(data: bytes, off: int, acc: int):
+    """Option test, at most one safe r64 MOV, default load and CMOVNE.
+
+    Never scan across unknown instructions: a flag writer would make CMOVNE
+    select on something other than the Option discriminant. A MOV is safe
+    only when it preserves the clamped value in the accumulator.
+    """
+    flag = None
+    t = _dec_rr(data, off, 0x85)           # test opt, opt
+    if t is not None:
+        if t[0] != t[1]:
+            return None
+        p = t[2]
+    else:
+        flag = _dec_cmp_mem8_zero(data, off)
+        if flag is None or flag["base"] == acc:
+            return None
+        p = flag["end"]
+    move = _dec_rr(data, p, 0x89)         # mov dst, src (reg field is src)
+    if move is not None:
+        dst, p = move[1], move[2]
+    else:
+        move = _dec_rr(data, p, 0x8B)     # alternate register MOV encoding
+        if move is not None:
+            dst, p = move[0], move[2]
+    if move is not None and dst == acc:
+        return None
+    m = _dec_mov_r32_imm(data, p)
+    if m is None:
+        return None
+    res, default, p = m
+    cn = _dec_cmov(data, p, 0x45)         # cmovne res, acc
+    if res == acc or cn is None or cn[0] != res or cn[1] != acc:
+        return None
+    return {"res": res, "default": default, "option": flag}
+
+
+def _request_cap_option_load_ok(data: bytes, off: int, val: int, flag) -> bool:
+    """For a memory Option, require its value load immediately before the clamp.
+
+    Option<u64> stores its value eight bytes after the byte discriminant.
+    REX.W 8B plus a plain ModR/M operand is at most seven bytes long.
+    The load stays untouched by both the original and patched clamp forms.
+    """
+    if flag is None:
+        return True
+    if val == flag["base"]:
+        return False
+    for start in range(max(0, off - 7), off - 2):
+        rex = data[start]
+        if not (0x48 <= rex <= 0x4F) or data[start + 1] != 0x8B:
+            continue
+        mem = _mem_operand(data, start + 2, rex)
+        if (mem is not None and mem["end"] == off and mem["reg"] == val
+                and mem["base"] == flag["base"] and mem["disp"] == flag["disp"] + 8):
+            return True
+    return False
+
+
 def _decode_request_cap(data: bytes, off: int):
     """Decode the unpatched `.min(cap)` half at `off`, or None.
 
-    `unwrap_or(default).min(cap)` with the Option discriminant in a register:
+    `unwrap_or(default).min(cap)` with either Option discriminant layout:
 
         cmp  <val64>, <cap>       83 /7 imm8   (mod=11, reg=7)
         mov  <acc32>, <cap>       b8+acc imm32
         cmovb <acc64>, <val64>    0f 42 /r
         test <opt64>, <opt64>     85 /r  (reg == rm)
+          OR cmp byte [option],0 (requires preceding mov val,[option+8])
+        [mov <saved64>,<opt64>]  optional; must preserve flags and acc
         mov  <res32>, <default>   b8+res imm32
         cmovne <res64>, <acc64>   0f 45 /r
 
@@ -1332,30 +1416,28 @@ def _decode_request_cap(data: bytes, off: int):
     if m1 is None:
         return None
     acc, cap32, p = m1
+    # imm8 is sign-extended by the CPU; this shape supports positive caps <128.
+    if not (1 <= cap8 < 128) or cap8 != cap32 or acc == val:
+        return None
     cb = _dec_cmov(data, p, 0x42)          # cmovb acc, val
     if cb is None or cb[0] != acc or cb[1] != val:
         return None
-    t = _dec_rr(data, cb[2], 0x85)         # test opt, opt
-    if t is None or t[0] != t[1]:
+    tail = _decode_request_cap_tail(data, cb[2], acc)
+    if tail is None or not _request_cap_option_load_ok(data, off, val, tail["option"]):
         return None
-    m2 = _dec_mov_r32_imm(data, t[2])
-    if m2 is None:
-        return None
-    res, default, p = m2
-    cn = _dec_cmov(data, p, 0x45)          # cmovne res, acc
-    if cn is None or cn[0] != res or cn[1] != acc:
-        return None
-    if cap8 != cap32:
-        return None
-    return {"off": off, "len": cb[2] - off, "cap": cap32, "default": default,
-            "val": val, "acc": acc, "res": res, "patched": False}
+    return {"off": off, "len": cb[2] - off, "cap": cap32, "default": tail["default"],
+            "val": val, "acc": acc, "res": tail["res"], "patched": False}
 
 
 def _decode_request_cap_patched(data: bytes, off: int):
     """Recognize the site-7 rewrite so --dry-run stays idempotent:
 
         mov <acc32>, REQUEST_MAX_RETRIES ; cmp <val64>,<acc64> ;
-        cmovb <acc64>,<val64>   (then NOP padding to the original length)"""
+        cmovb <acc64>,<val64> ; nop ; <verified Option/default tail>
+
+    Retain the result-register link even after patching; an unrelated
+    `.min(9999)` near the provider literal is not proof of this site.
+    """
     m = _dec_mov_r32_imm(data, off)
     if m is None or m[1] != REQUEST_MAX_RETRIES:
         return None
@@ -1365,10 +1447,17 @@ def _decode_request_cap_patched(data: bytes, off: int):
         return None
     val = cm[1]
     cb = _dec_cmov(data, cm[2], 0x42)      # cmovb acc, val
-    if cb is None or cb[0] != acc or cb[1] != val:
+    if acc == val or cb is None or cb[0] != acc or cb[1] != val:
         return None
-    return {"off": off, "cap": cap, "default": None, "val": val,
-            "acc": acc, "res": None, "patched": True}
+    # Our rewrite is exactly one byte shorter than the original clamp.
+    end = cb[2] + 1
+    if data[cb[2]:end] != b"\x90":
+        return None
+    tail = _decode_request_cap_tail(data, end, acc)
+    if tail is None or not _request_cap_option_load_ok(data, off, val, tail["option"]):
+        return None
+    return {"off": off, "len": end - off, "cap": cap, "default": tail["default"],
+            "val": val, "acc": acc, "res": tail["res"], "patched": True}
 
 
 def make_request_cap_patch(acc: int, val: int, region_len: int,
@@ -1406,10 +1495,16 @@ def find_request_cap_sites(data: bytes, literals: list[dict]) -> list[dict]:
             st = _decode_request_cap(data, off) or _decode_request_cap_patched(data, off)
             if st is None or abs(off - lit["movw"]) >= REQUEST_CAP_WINDOW:
                 continue
-            if not st["patched"] and st["res"] != want:
+            if st["res"] != want:
                 continue
             out.append(st)
     return out
+
+
+def _request_cap_summary(sites: list[dict]) -> str:
+    if not sites:
+        return "0 site(s) - NOT PATCHED (hard cap unchanged)"
+    return f"{len(sites)} site(s) -> {REQUEST_MAX_RETRIES}"
 
 
 # ── Plan ──────────────────────────────────────────────────────────────────────
@@ -1695,7 +1790,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
               f"cmp {reg_name(s['val'])},{reg_name(s['acc'])} ; "
               f"cmovb {reg_name(s['acc'])},{reg_name(s['val'])}")
     if not req_sites:
-        print(f"  NOT FOUND - skipping (request_max_retries stays capped at 100)")
+        print("  NOT FOUND - skipping (request_max_retries hard cap unchanged)")
     for s in req_sites:
         if not s["patched"]:
             edits.append((s["off"], make_request_cap_patch(
@@ -1710,7 +1805,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     print(f"  retry-after  : {len(ra_sites)} site(s) -> {ra_status}")
     print(f"  conn ladder  : {len(conn_sites)} site(s) -> {secs}s flat")
     print(f"  retry 429    : {len(ra429_sites)} site(s) -> retryable")
-    print(f"  request cap  : {len(req_sites)} site(s) -> {REQUEST_MAX_RETRIES}")
+    print(f"  request cap  : {_request_cap_summary(req_sites)}")
     print(f"  retry interval: {ms}ms")
 
     if dry_run:
@@ -2255,15 +2350,19 @@ def _self_test_site7() -> None:
         rex = 0x48 | (1 if src >= 8 else 0) | (0x4 if dst >= 8 else 0)
         return bytes([rex, 0x0F, op2, 0xC0 | ((dst & 7) << 3) | (src & 7)])
 
-    def clamp(acc=0, val=13, res=6, opt=12, cap=100, default=4):
+    def clamp_head(acc, val, cap):
         return (bytes([0x48 | (1 if val >= 8 else 0), 0x83, 0xF8 | (val & 7), cap])
-                + mov_imm(acc, cap) + cmov(acc, val, 0x42)
-                + rr(opt, opt, 0x85) + mov_imm(res, default) + cmov(res, acc, 0x45))
+                + mov_imm(acc, cap) + cmov(acc, val, 0x42))
+
+    def clamp(acc=0, val=13, res=6, opt=12, cap=100, default=4):
+        return (clamp_head(acc, val, cap) + rr(opt, opt, 0x85)
+                + mov_imm(res, default) + cmov(res, acc, 0x45))
 
     def wrap(lit, clamp_bytes=None):
         return b"\x00" * 0x40 + lit + b"\x00" * 0x40 + (clamp() if clamp_bytes is None else clamp_bytes) + b"\x00" * 0x40
 
-    def build(acc, val, res, opt=12, cap=100, default=4, lit_reg=None):
+    def build(acc, val, res, opt=12, cap=100, default=4, lit_reg=None,
+              clamp_bytes=None):
         lit_reg = res if lit_reg is None else lit_reg
         nano = 0x98
         lit = (b"\xc7\x80" + struct.pack("<i", nano) + struct.pack("<I", 200_000_000)
@@ -2272,7 +2371,8 @@ def _self_test_site7() -> None:
                + struct.pack("<i", nano + 8)
                + b"\x66\xc7\x80" + struct.pack("<i", nano + 0x10) + struct.pack("<H", 0x0100)
                + b"\xc6\x80" + struct.pack("<i", nano + 0x12) + b"\x01")
-        return wrap(lit, clamp(acc, val, res, opt, cap, default))
+        return wrap(lit, clamp(acc, val, res, opt, cap, default)
+                    if clamp_bytes is None else clamp_bytes)
 
     # The real register set: value r13, accumulator rax, result rsi (max_attempts).
     blob = build(acc=0, val=13, res=6)
@@ -2291,7 +2391,10 @@ def _self_test_site7() -> None:
     done[s["off"] : s["off"] + len(patch)] = patch
     again = find_request_cap_sites(bytes(done), lits)
     assert len(again) == 1 and again[0]["patched"] is True, again
-    # REX.B (`mov r8d, imm32`) keeps the rewrite at 13 bytes without the NOP.
+    assert (again[0]["default"], again[0]["res"], again[0]["len"]) == (4, 6, 13)
+    assert len(done) == len(blob) and done[:s["off"]] == blob[:s["off"]]
+    assert done[s["off"] + s["len"]:] == blob[s["off"] + s["len"]:]
+    # A high accumulator adds a REX.B byte to both the original and rewrite.
     assert make_request_cap_patch(8, 13, 14, 9999)[:2] == b"\x41\xb8"
     assert len(make_request_cap_patch(8, 13, 14, 9999)) == 14
     assert len(make_request_cap_patch(0, 13, 13, 9999)) == 13
@@ -2302,6 +2405,16 @@ def _self_test_site7() -> None:
     # this site -- that is what keeps unrelated `.min(100)` shapes out.
     other = build(acc=0, val=13, res=1, lit_reg=6)
     assert find_request_cap_sites(other, find_retry_429_sites(other)) == []
+    other_off = _find_clamp_off(other)
+    other_site = _decode_request_cap(other, other_off)
+    other_patch = make_request_cap_patch(other_site["acc"], other_site["val"],
+                                        other_site["len"])
+    other_done = bytearray(other)
+    other_done[other_off:other_off + len(other_patch)] = other_patch
+    # The already-patched form must retain the same semantic register link.
+    assert find_request_cap_sites(bytes(other_done),
+                                  find_retry_429_sites(bytes(other_done))) == []
+    assert _decode_request_cap_patched(other_patch, 0) is None  # no Option/default tail
     # Both immediates of the clamp have to agree (cmp imm8 == mov imm32).
     bad = bytearray(blob)
     off = _find_clamp_off(blob)
@@ -2327,6 +2440,123 @@ def _self_test_site7() -> None:
         assert len(found) == 1 and found[0]["max_attempts_reg"] == 6, (name, found)
         linked = find_request_cap_sites(extra, found)
         assert len(linked) == 1 and linked[0]["res"] == 6, (name, linked)
+
+    def mem(opcode, reg, base, disp, *, wide=True, disp32=False):
+        rex = 0x40 | (8 if wide else 0) | (4 if reg >= 8 else 0) | (1 if base >= 8 else 0)
+        prefix = bytes([rex]) if rex != 0x40 else b""
+        if not disp32 and disp == 0 and (base & 7) != 5:
+            mod, displacement = 0, b""
+        elif not disp32 and -128 <= disp <= 127:
+            mod, displacement = 1, struct.pack("<b", disp)
+        else:
+            mod, displacement = 2, struct.pack("<i", disp)
+        return (prefix + bytes([opcode, (mod << 6) | ((reg & 7) << 3) | (base & 7)])
+                + displacement)
+
+    def memory_clamp(acc=1, val=0, res=5, base=5, disp=0, disp32=False,
+                     copy=True, copy_opcode=0x89, cap=100, default=4,
+                     load=None, flag=None, gap=None):
+        load = (mem(0x8B, val, base, disp + 8, disp32=disp32)
+                if load is None else load)
+        flag = (mem(0x80, 7, base, disp, wide=False, disp32=disp32) + b"\x00"
+                if flag is None else flag)
+        if gap is None:
+            gap = (rr(base, val, 0x89) if copy_opcode == 0x89 else rr(val, base, 0x8B)
+                   ) if copy else b""
+        return (load + clamp_head(acc, val, cap) + flag + gap
+                + mov_imm(res, default) + cmov(res, acc, 0x45))
+
+    # Verbatim 0.167.2 clamp: rax value, rcx accumulator, rbp result/Option.
+    native = bytes.fromhex(
+        "488b4508 4883f864 b964000000 480f42c8 "
+        "807d0000 4889e8 bd04000000 480f45e9")
+    assert memory_clamp() == native
+    native_site = _decode_request_cap(native, 4)
+    assert (native_site["cap"], native_site["default"], native_site["val"],
+            native_site["acc"], native_site["res"], native_site["len"]) == (
+                100, 4, 0, 1, 5, 13), native_site
+    assert make_request_cap_patch(1, 0, 13) == bytes.fromhex(
+        "b90f270000 4839c8 480f42c8 90")
+
+    # Equivalent memory Options: plain/disp8/disp32, high registers, optional
+    # copy and retuned constants. Both original and patched forms must link.
+    cases = ({}, {"copy": False}, {"copy_opcode": 0x8B},
+             {"disp": 24}, {"disp": -32}, {"disp32": True},
+             {"base": 8, "val": 13, "res": 6},
+             {"base": 13, "acc": 8, "res": 13},
+             {"base": 0, "val": 2, "res": 6},
+             {"cap": 50, "default": 7}, {"cap": 127})
+    for case in cases:
+        acc, val, res = case.get("acc", 1), case.get("val", 0), case.get("res", 5)
+        extra = build(acc, val, res, clamp_bytes=memory_clamp(**case))
+        linked = find_request_cap_sites(extra, find_retry_429_sites(extra))
+        assert len(linked) == 1, (case, linked)
+        st = linked[0]
+        assert (st["cap"], st["default"], st["val"], st["acc"], st["res"]) == (
+            case.get("cap", 100), case.get("default", 4), val, acc, res), (case, st)
+        assert st["len"] == 13 + (acc >= 8) and not st["patched"], (case, st)
+        rewrite = make_request_cap_patch(acc, val, st["len"])
+        patched = bytearray(extra)
+        patched[st["off"]:st["off"] + st["len"]] = rewrite
+        assert len(patched) == len(extra)
+        assert patched[:st["off"]] == extra[:st["off"]]
+        assert patched[st["off"] + st["len"]:] == extra[st["off"] + st["len"]:]
+        reread = find_request_cap_sites(bytes(patched), find_retry_429_sites(bytes(patched)))
+        assert len(reread) == 1 and reread[0]["patched"], (case, reread)
+        assert (reread[0]["res"], reread[0]["default"], reread[0]["len"]) == (
+            res, st["default"], st["len"]), (case, reread)
+
+    # Reject non-Option memory tests and changes to the flags/clamped value.
+    negatives = (
+        {"load": b""},
+        {"load": bytes.fromhex("488b4510")},       # value at +16, not +8
+        {"load": bytes.fromhex("488b5508")},       # value loaded into wrong register
+        {"load": bytes.fromhex("488b4308")},       # different Option base
+        {"flag": bytes.fromhex("807d0001")},       # compared to 1, not 0
+        {"flag": bytes.fromhex("807b0000")},       # different Option base
+        {"flag": bytes.fromhex("48837d0000")},     # 64-bit, not byte discriminant
+        {"flag": bytes.fromhex("80f800")},         # register-direct
+        {"flag": bytes.fromhex("803c2400")},       # SIB, not plain base
+        {"flag": bytes.fromhex("803d0000000000")}, # RIP-relative
+        {"gap": bytes.fromhex("31c0")},            # XOR clobbers flags
+        {"gap": bytes.fromhex("4883c001")},        # ADD clobbers flags
+        {"gap": bytes.fromhex("4885c0")},          # another TEST replaces flags
+        {"gap": bytes.fromhex("e800000000")},      # arbitrary CALL
+        {"gap": bytes.fromhex("eb00")},            # branch
+        {"gap": bytes.fromhex("4889e9")},          # overwrites rcx accumulator
+        {"gap": bytes.fromhex("488bcd")},          # same clobber via 8B MOV
+        {"gap": bytes.fromhex("488b4508")},        # memory load, not register MOV
+        {"gap": bytes.fromhex("4889e8 4889c2")},   # more than one MOV
+        {"res": 1},                               # default overwrites accumulator
+        {"acc": 0},                               # accumulator aliases value
+        {"base": 1},                              # accumulator overwrites Option base
+        {"base": 0},                              # value load overwrites Option base
+        {"cap": 0}, {"cap": 128}, {"cap": 255},    # zero / sign-extended imm8
+    )
+    for case in negatives:
+        body = memory_clamp(**case)
+        extra = build(1, 0, 5, clamp_bytes=body)
+        assert find_request_cap_sites(extra, find_retry_429_sites(extra)) == [], case
+
+    unrelated = build(1, 0, 5, lit_reg=6, clamp_bytes=native)
+    assert find_request_cap_sites(unrelated, find_retry_429_sites(unrelated)) == []
+    at = _find_clamp_off(unrelated)
+    unrelated_done = bytearray(unrelated)
+    unrelated_done[at:at + 13] = make_request_cap_patch(1, 0, 13)
+    assert find_request_cap_sites(bytes(unrelated_done),
+                                  find_retry_429_sites(bytes(unrelated_done))) == []
+
+    # All truncated original/patched tails must fail closed without raising.
+    native_done = bytearray(native)
+    native_done[4:17] = make_request_cap_patch(1, 0, 13)
+    for end in range(len(native)):
+        assert _decode_request_cap(native[:end], 4) is None, end
+        assert _decode_request_cap_patched(bytes(native_done[:end]), 4) is None, end
+    assert _decode_request_cap_patched(bytes(native_done), 4)["res"] == 5
+    missing_summary = _request_cap_summary([])
+    assert "NOT PATCHED" in missing_summary and "unchanged" in missing_summary
+    assert "->" not in missing_summary and str(REQUEST_MAX_RETRIES) not in missing_summary
+    assert _request_cap_summary([native_site]) == f"1 site(s) -> {REQUEST_MAX_RETRIES}"
 
 
 def _find_clamp_off(blob: bytes) -> int:

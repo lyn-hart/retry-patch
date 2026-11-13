@@ -139,10 +139,11 @@ stream_idle_timeout_ms = 15000
 
 ### 版本适配说明（重要）
 
-脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。当前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）和 **0.159.2**（Windows x64 PE，站点 1-5 全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
+脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。**codex 0.167.2** 已在本机 Linux x64 ELF 上通过自检与 `--dry-run`，站点 1-7 全部命中（未向安装的二进制写入补丁）：抖动 3 处、stream cap 3 处、Retry-After 3 处、连接阶梯 2 处、429 开关 1 处、request cap 1 处。此前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）和 **0.159.2**（Windows x64 PE，站点 1-5 全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
 
-- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。站点 6 在 0.162.1 Linux 上是 1 处（`HTTP 429 retryability` 小节，`movw $0x0100`）；若该节报 `NOT FOUND`，裸 429 仍会一次不重试。站点 7 也是 1 处（`request_max_retries hard cap` 小节），带 `linked: result feeds max_attempts ...`；若该节报 `NOT FOUND`，`request_max_retries` 仍卡在 100。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
-- **内置自检**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接）。
+- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。站点 6 在 0.162.1 Linux 上是 1 处（`HTTP 429 retryability` 小节，`movw $0x0100`）；若该节报 `NOT FOUND`，裸 429 仍会一次不重试。站点 7 也是 1 处（`request_max_retries hard cap` 小节），带 `linked: result feeds max_attempts ...`；若该节报 `NOT FOUND`，该上限保持原值，汇总明确显示 `NOT PATCHED`，不会误报已抬到 9999（本机 0.167.2 的原值为 100）。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
+- **内置自检**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接），以及 0.167.2 的内存 Option、保留标志的寄存器 MOV、拒绝覆写标志/累加器、重复识别、截断输入和未命中的汇总。
+- **v0.167.2 的站点 7**：Option 判别改为 `cmp byte[option],0`，中间还调度了一条保存 Option 指针的寄存器 `mov`。新版检测器要求此前的配置值加载来自同一 Option 的 `+8` 字段，只允许一条不覆盖累加器、不修改标志的寄存器 MOV；实际改写仍只覆盖 `cmp/mov/cmovb` 的 13 字节，Option 判别、默认值 4 和后续代码全部保留。
 - **v0.156.1 → v0.159.1 变了什么**：两个 backoff 的结构判据没变（116 个 `from_millis` 尾部里仍恰好 2 处）。`retry.rs` 把 `Duration` 换成毫秒的 `imul * 1000` 挪到了尾部前 445 字节，超出原来的 320 字节抖动窗口，标签要单独回扫 1024 字节，否则两处都会被印成 `util.rs::backoff`。站点 4 从 2 处变成 4 处，多出来的两处 call 落在 `retry.rs::backoff` 里，验证通过就照打。
 - **v0.142.4 → v0.143.0 变了什么**（供下次排查参照）：
   1. 抖动 `random_range(0.9..1.1)` 的编译产物从「相邻 `0.9`/`1.1` 常量对」改成「下限 `0.9` + 区间宽度 `0.2`」，且 `0.9` 常量被两个 backoff 去重共享，旧的「相邻 0.9/1.1 对」定位失效。
@@ -160,7 +161,7 @@ stream_idle_timeout_ms = 15000
 | 4 | 跟着 `call` 穿过 GOT 槽拿到函数入口，确认站点 2 改过的抖动代码落在函数体内 | 寄存器编号、`cmp/jne` 的具体编码 |
 | 5 | ①7 字节 load pair 形状②后随两条 store + RIP 相对 `lea`③同一函数内有 `.min(cap)` 的**成对** `cmp r64,cap+1` / `cmp r64,cap`（上限值读出来，不假设是 60） | 硬编码 60s、单条 `cmp`（会误命中 tracing 等级检查） |
 | 6 | ①一条 `movl $nanos,disp`（nanos 取值落在合法 Duration 区间）②同基址、位移恰为 `disp+0x08` 的 `mov r64, mem`（记下源寄存器给站点 7）③同基址、位移恰为 `disp+0x10` 的 `movw $0x0100`④紧随其后、位移为 `disp+0x12` 的 `movb $1`。四条 store 都用同一套 mem 操作数解码（disp8/disp32/REX.B），位移关系而非绝对值定案，`movw` 的高字节（retry_5xx=1）同时校验 | 硬编码 `0x98`/`0xa8` 偏移、硬编码 base_delay 200ms、硬编码寄存器 |
-| 7 | ①`cmp val,imm8` + `mov acc,imm32`（两个立即数必须相等）+ `cmovb` + `test opt,opt` + `mov res,default` + `cmovne`，且寄存器逐一对应②结果寄存器必须等于站点 6 字面量装载 `max_attempts` 的寄存器③必须落在该字面量同一函数内（±0x800）。②是语义链接，把无关的 10 处同形 `.min(100)` 全都排除 | 硬编码寄存器（r13/rax/rsi）、硬编码默认 4、硬编码偏移 |
+| 7 | ①`cmp val,imm8` + `mov acc,imm32`（两个立即数必须相等，正值且小于 128）+ `cmovb` + Option 判别（`test opt,opt`，或 `cmp byte[option],0` 且前置 `mov val,[option+8]`）+ 可选一条保留标志且不覆盖 acc 的寄存器 MOV + `mov res,default` + `cmovne`，寄存器逐一对应②结果寄存器必须等于站点 6 字面量装载 `max_attempts` 的寄存器，已打补丁形态也必须满足③必须位于该字面量 ±0x800 范围内。②是语义链接，排除无关同形夹取 | 硬编码寄存器（r13/rax/rsi、0.167.2 的 rax/rcx/rbp）、硬编码默认 4、硬编码偏移 |
 
 配合几道兜底：站点 5 命中超过 4 处、站点 6/7 命中超过 1 处直接拒绝（宁可不打也不猜），站点 1/2 覆写区间必须落在 5~256 字节。
 
