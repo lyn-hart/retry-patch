@@ -2,9 +2,10 @@
 """
 Patch Codex CLI's retry backoff interval -- Linux/macOS build (ELF / Mach-O).
 
-Verified against codex 0.164.0 and 0.159.1 (x86_64-unknown-linux-musl). This is the
-Unix (ELF/Mach-O) build of the codex patcher; for the Windows PE build use
-codex-windows.py. Dry-run validation also covers codex 0.167.2 on Linux x64.
+Verified against codex 0.172.0, 0.164.0 and 0.159.1 (x86_64-unknown-linux-musl).
+This is the Unix (ELF/Mach-O) build of the codex patcher; for the Windows PE
+build use codex-windows.py. Dry-run validation also covers codex 0.167.2 on
+Linux x64.
 The two jittered backoffs it targets are:
 
   1. codex-client/src/retry.rs::backoff(base, attempt)  -- generic retry path
@@ -39,9 +40,10 @@ Location is anchored on the same x86-64 Rust codegen used by ELF and Mach-O:
     jitter sites from unrelated 0.9 uses -- a plain `movsd [0.9]` is ignored;
     the MSVC-only movsd variant lives in the Windows script);
   * the `mov rax,reg / shr rax,3 / movabs <from_millis magic>` tail.
-RIP-relative operands resolve in file-offset space on the single-mapping ELF /
-Mach-O images, so no VA translation is needed (that is the PE-only complication
-handled by the Windows script).
+RIP-relative operands are resolved through the segment VA maps. Up to 0.167.2
+the image was effectively one mapping and plain file offsets happened to work;
+0.172.0 puts `.rodata` and `.text` in PT_LOADs with different `vaddr - offset`
+(0 and 0x1000), so a file-offset add misses every jitter constant by 0x1000.
 
 Site 3 (stream_max_retries().min(100) hard cap) is unchanged from prior builds:
 the inlined `unwrap_or(5).min(100)` codegen is byte-identical, so the same tail
@@ -71,6 +73,12 @@ core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
      only that `je` to an unconditional jump, leaving error eligibility alone.
      This form requires an ELF unwind-table-confirmed backoff entry, decoded
      argument setup and a verified Some-arm exit; 16 sites match on 0.164.0.
+     0.172.0 lays the shared `CodexErr::retry_delay` out the other way round:
+         cmp r32,-1 ; jne <Some arm> ; <backoff args> ; call backoff ; ret
+     Here the `jne` is NOPed so the fall-through backoff always runs. It is
+     accepted only when the call is followed by a return epilogue and the Some
+     arm ends in the decoded remaining-delay result plus that same epilogue.
+     25 sites match on 0.172.0 (24 `je` request-retry copies and this one).
 
   5. The `unbounded_connection_retries` ladder (Stable, default ON): on a
      ConnectionFailed the delay is a separate field that starts at
@@ -83,6 +91,8 @@ core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
      Both forms are exactly 7 bytes, so the stores of that pair into the async
      state machine (which is what identifies the sequence) stay in place. Site 5
      can only express whole seconds; RETRY_MS is rounded up to >=1s for it.
+     The warn! level check that follows the stores is a RIP-relative `lea` up
+     to 0.167.2 and a RIP-relative GOT `mov` in 0.172.0 (3 sites there).
 
   6. `ApiRetryConfig.retry_429` in `ModelProviderInfo::to_api_provider` is
      hardwired to `false`, so the HTTP layer's `RetryOn::should_retry` -- which
@@ -232,7 +242,9 @@ MAX_CONN_SITES = 4
 # in the same function -- a `cmp r64, imm8` against a whole-second cap. Bounded
 # by imm8 encoding; the range covers any plausible retry ceiling (currently 60s).
 LADDER_CAP_MIN, LADDER_CAP_MAX = 2, 127
-LADDER_WINDOW = 0x1000
+# The clamp sits up to 0xf0e bytes from the load on 0.172.0; the whole image
+# holds only five such compare pairs, so the extra reach admits no decoy.
+LADDER_WINDOW = 0x2000
 # Bytes between the `cmp r64,cap+1` and `cmp r64,cap` halves of the saturating
 # min() (on this build a single `setae` sits between them).
 LADDER_PAIR_GAP = 12
@@ -330,10 +342,10 @@ def validate_ms(ms: int) -> None:
 def load_segments(data: bytes, fmt: str) -> list[tuple[int, int, int]]:
     """[(file_off, vaddr, file_size)] for every mapped segment.
 
-    Sites 1-3 compare RIP operands that land in the same single mapping, so they
-    stay in file-offset space. Site 4 has to *dereference* a GOT slot in the
-    writable segment, where `p_offset != p_vaddr` (a 0x1000 skew on this build),
-    so it needs a real translation in both directions."""
+    Sites 1-2 read `.rodata` constants from `.text`, and site 4 has to
+    *dereference* a GOT slot in the writable segment. Each of those segments
+    can carry its own `p_vaddr - p_offset` (0 / 0x1000 / 0x2000 on 0.172.0),
+    so both need a real translation in both directions."""
     segs: list[tuple[int, int, int]] = []
     if fmt == "elf":
         phoff = struct.unpack_from("<Q", data, 0x20)[0]
@@ -492,9 +504,20 @@ def _f64_at(data: bytes, off: int):
     return value
 
 
-def _jitter_bound_loads(data: bytes, lo: int, hi: int) -> list[tuple[int, int, float]]:
+def _identity(off: int) -> int:
+    return off
+
+
+def _jitter_bound_loads(data: bytes, lo: int, hi: int,
+                        off2va=_identity, va2off=_identity
+                        ) -> list[tuple[int, int, float]]:
     """(instr_off, const_off, value) for every reg-form SSE2 f64 `[rip+disp32]`
     load in [lo,hi) whose constant is a plausible *jitter multiplier bound*.
+
+    The operand is resolved through the VA maps: since 0.172.0 `.rodata` and
+    `.text` sit in different PT_LOADs with different `p_vaddr - p_offset`
+    (0 and 0x1000), so adding the displacement to a *file* offset lands 0x1000
+    short of the constant. The identity default is for single-mapping blobs.
 
     This is what replaces hunting for the literal 0.9: `random_range(a..b)`
     multiplies a delay by a factor near 1.0, so any bound must sit in
@@ -509,8 +532,9 @@ def _jitter_bound_loads(data: bytes, lo: int, hi: int) -> list[tuple[int, int, f
             while i != -1:
                 if (data[i + plen] & 0xC7) == 0x05:  # [rip+disp32]
                     disp = struct.unpack_from("<i", data, i + plen + 1)[0]
-                    const = (i + plen + 5) + disp
-                    value = _f64_at(data, const)
+                    next_va = off2va(i + plen + 5)
+                    const = None if next_va is None else va2off(next_va + disp)
+                    value = None if const is None else _f64_at(data, const)
                     if (value is not None and value != 1.0
                             and JITTER_BOUND_MIN < value < JITTER_BOUND_MAX):
                         out.append((i, const, value))
@@ -561,7 +585,7 @@ def _all_from_millis_tails(data: bytes) -> list[tuple[int, int]]:
     return out
 
 
-def find_jitter_sites(data: bytes) -> list[dict]:
+def find_jitter_sites(data: bytes, off2va=_identity, va2off=_identity) -> list[dict]:
     """Locate every `Duration::from_millis((delay * jitter) as u64)` site.
 
     Driven by *structure*, not by a known constant. For each inlined from_millis
@@ -591,7 +615,8 @@ def find_jitter_sites(data: bytes) -> list[dict]:
         region_start, region_end = mul[0] + mul[1], mv
         if not (REGION_MIN <= region_end - region_start <= REGION_MAX):
             continue
-        bounds = _jitter_bound_loads(data, max(0, mv - JITTER_SCAN_BACK), mv)
+        bounds = _jitter_bound_loads(data, max(0, mv - JITTER_SCAN_BACK), mv,
+                                     off2va, va2off)
         if not bounds:
             continue
         anchor, _const, _value = bounds[0]
@@ -876,6 +901,84 @@ def _some_arm_skips_backoff(data: bytes, some: int, backoff: int, call_end: int,
             and _some_delay_tail_ok(data, some, backoff - 5))
 
 
+def _return_epilogue(data: bytes, off: int):
+    """Bytes of `add rsp,imm8 ; pop r64... ; ret` at `off`, or None."""
+    if (off + 4 > len(data) or data[off:off + 3] != b"\x48\x83\xc4"
+            or not 0 < data[off + 3] < 0x80):
+        return None
+    i = off + 4
+    while i < min(off + 16, len(data)):
+        if data[i] == 0xC3:
+            return bytes(data[off:i + 1])
+        if 0x58 <= data[i] <= 0x5F:
+            i += 1
+        elif data[i] == 0x41 and i + 1 < len(data) and 0x58 <= data[i + 1] <= 0x5F:
+            i += 2
+        else:
+            return None
+    return None
+
+
+def _deadline_fallthrough_site(data: bytes, cmp_off: int, reg: int, branch: int,
+                               in_backoff, function_starts: list[int] | None):
+    """0.172 shared retry_delay: the backoff is the fall-through arm.
+
+        cmp r32,-1 ; jne <Some> ; <args> ; call backoff ; <epilogue>
+        ...
+        Some: <remaining delay> ; <same epilogue>
+
+    NOP the `jne`. The Some arm is proven by its decoded result and by
+    returning through the identical epilogue, which also survives the rewrite
+    so a patched site is re-read the same way. The neighbouring
+    `cmp r32,-1 ; je <return None>` (RetryLimit, no fallback) reaches no
+    backoff call and is never matched.
+    """
+    if data[branch:branch + 1] == b"\x75":
+        length, patched = 2, False
+    elif data[branch:branch + 2] == b"\x0f\x85":
+        length, patched = 6, False
+    elif data[branch:branch + 2] == NOP_RUNS[2]:
+        length, patched = 2, True
+    elif data[branch:branch + 6] == NOP_RUNS[6]:
+        length, patched = 6, True
+    else:
+        return None
+    after = branch + length
+    if after > len(data):
+        return None
+    found = _deadline_backoff_call(data, after, in_backoff)
+    if found is None:
+        return None
+    call, call_len = found
+    epilogue = _return_epilogue(data, call + call_len)
+    if epilogue is None:
+        return None
+    arm_lo = call + call_len + len(epilogue)
+    caller_end = len(data)
+    if function_starts is not None:
+        caller = bisect.bisect_right(function_starts, cmp_off) - 1
+        if not 0 <= caller < len(function_starts) - 1:
+            return None
+        caller_end = function_starts[caller + 1]
+    result = None
+    for off in range(arm_lo, min(arm_lo + SITE4_SOME_WINDOW, caller_end)):
+        end = _remaining_delay_end(data, off)
+        if (end is not None and end + len(epilogue) <= caller_end
+                and data[end:end + len(epilogue)] == epilogue):
+            result = off
+            break
+    if result is None:
+        return None
+    if not patched:
+        some = after + int.from_bytes(data[after - (1 if length == 2 else 4):after],
+                                      "little", signed=True)
+        if not arm_lo <= some <= result:
+            return None
+    return {"cmp": cmp_off, "reg": reg, "branch": branch, "len": length,
+            "call": call, "patched": patched, "condition": "jne",
+            "none": 0xFFFF_FFFF, "patch": NOP_RUNS[length]}
+
+
 def _find_deadline_retry_after_sites(data: bytes, in_backoff,
                                     function_starts: list[int] | None = None) -> list[dict]:
     """0.164 Option<Instant> None (-1): force the existing backoff arm.
@@ -883,6 +986,7 @@ def _find_deadline_retry_after_sites(data: bytes, in_backoff,
     JE rel8 becomes JMP rel8; JE rel32 becomes NOP + JMP rel32. The latter
     keeps the same instruction end, so its relative displacement is unchanged.
     Both patched forms retain enough structure for an idempotent re-read.
+    A `jne` over a fall-through backoff (0.172) is _deadline_fallthrough_site.
     """
     out = []
     for m in SITE4_DEADLINE_CMP.finditer(data):
@@ -908,6 +1012,10 @@ def _find_deadline_retry_after_sites(data: bytes, in_backoff,
             disp_off = branch + 2
             prefix = b"\x90\xe9"
         else:
+            site = _deadline_fallthrough_site(data, cmp_off, reg, branch,
+                                              in_backoff, function_starts)
+            if site is not None:
+                out.append(site)
             continue
         some = branch + length
         if some > len(data):
@@ -942,13 +1050,14 @@ def _conn_tail_ok(data: bytes, off: int, secs_reg: int, nanos_reg: int) -> bool:
         mov [<base>+disp32], <secs64>    ; spill the Duration into the
         mov [<base>+disp32], <nanos32>   ;   async poll state machine
         lea <r64>, [rip+disp32]          ; static-level check of the warn! that
-                                         ;   reports the wait
+          OR mov <r64>, [rip+disp32]     ;   reports the wait (0.172.0 reaches
+                                         ;   the static through the GOT)
 
-    The rip-relative `lea` is load-bearing: unrelated code also spills a
+    The rip-relative operand is load-bearing: unrelated code also spills a
     {secs,nanos} pair into a state machine (a stray `mov eax,60 ; xor ecx,ecx`
     reads exactly like an already-patched site), and that code continues with
     base-relative `lea`s instead. It is a necessary condition only -- what
-    actually confirms the site is _has_ladder_near(), below."""
+    actually confirms the site is _ladder_cap_near(), below."""
     if data[off : off + 2] != b"\x48\x89":
         return False
     m1 = data[off + 2]
@@ -962,7 +1071,7 @@ def _conn_tail_ok(data: bytes, off: int, secs_reg: int, nanos_reg: int) -> bool:
             and (m2 & 7) == (m1 & 7)):
         return False
     lea = q + 6  # 89 <modrm> <disp32>
-    return (data[lea] in (0x48, 0x4C) and data[lea + 1] == 0x8D
+    return (data[lea] in (0x48, 0x4C) and data[lea + 1] in (0x8D, 0x8B)
             and (data[lea + 2] & 0xC7) == 0x05)
 
 
@@ -1537,10 +1646,10 @@ def jitter_label(data: bytes, site: dict) -> str:
     return "util.rs::backoff"
 
 
-def plan(data: bytes, ms: int):
+def plan(data: bytes, ms: int, off2va=_identity, va2off=_identity):
     """Return (edits, report). edits: [(off, bytes)]. report: [(label, site)]."""
     edits, report = [], []
-    sites = find_jitter_sites(data)
+    sites = find_jitter_sites(data, off2va, va2off)
     if len(sites) < len(SITE_LABELS):
         die(f"expected at least {len(SITE_LABELS)} jittered backoff sites "
             f"(0.9..1.1), found {len(sites)}")
@@ -1656,7 +1765,8 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     tails = _all_from_millis_tails(bytes(data))
     print(f"  {len(tails)} inlined Duration::from_millis tail(s) in the image; "
           f"keeping those with a mulsd + jitter-range bound upstream")
-    edits, report = plan(data, ms)
+    off2va, va2off = segment_maps(load_segments(bytes(data), fmt))
+    edits, report = plan(data, ms, off2va, va2off)
     for idx, (label, s) in enumerate(report, 1):
         span = s["region_end"] - s["region_start"]
         print(f"  [{idx}] {label}")
@@ -1687,7 +1797,6 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     # -- Site 4: Retry-After outranking the fixed backoff ---------------------
     print()
     print("=== Retry-After override (server delay vs backoff) ===")
-    off2va, va2off = segment_maps(load_segments(bytes(data), fmt))
     ra_sites = find_retry_after_sites(bytes(data), [s for _, s in report],
                                       off2va, va2off)
     if len(ra_sites) > MAX_RETRY_AFTER_SITES:
@@ -1695,8 +1804,9 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
               "are plausible - REFUSING to patch site 4 (signature went loose)")
         ra_sites = []
     for idx, s in enumerate(ra_sites, 1):
-        deadline = s["condition"] == "je"
-        state = ("already unconditional" if deadline else "already NOPed") \
+        deadline = s["none"] == 0xFFFF_FFFF
+        jump = s["condition"] == "je"
+        state = ("already unconditional" if jump else "already NOPed") \
             if s["patched"] else "live"
         niche = "Option<Instant>" if deadline else "Option<Duration>"
         print(f"  [{idx}] cmp {reg_name(s['reg'])},0x{s['none']:x} @ 0x{s['cmp']:x}"
@@ -1708,7 +1818,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
             target = _call_target_off(data, s["call"], off2va, va2off)
             print(f"        entry   : ELF unwind table confirms 0x{target:x}; "
                   "Some arm skips the call")
-        rewrite = "je -> unconditional jmp" if deadline else f"jne -> {s['len']}-byte NOP"
+        rewrite = "je -> unconditional jmp" if jump else f"jne -> {s['len']}-byte NOP"
         print(f"        rewrite : {rewrite} "
               f"(server Retry-After ignored, backoff always wins)")
     if not ra_sites:
@@ -1905,6 +2015,15 @@ def self_test() -> None:
         probe = bytearray(blob)
         struct.pack_into("<d", probe, c09, bound)
         assert len(find_jitter_sites(bytes(probe))) == expected, bound
+    # 0.172.0: .text is mapped 0x1000 above its file offset while .rodata is
+    # not, so the bound resolves only through the VA maps.
+    split = bytearray(blob)
+    struct.pack_into("<i", split, a_off + 4, c09 - (a_off + 8) - 0x1000)
+    text_va = lambda off: off + 0x1000 if off < c09 else off
+    text_off = lambda va: va - 0x1000 if va >= 0x1000 else va
+    assert find_jitter_sites(bytes(split)) == []
+    assert len(find_jitter_sites(bytes(split), text_va, text_off)) == 1
+    assert find_jitter_sites(bytes(split), lambda off: None, text_off) == []
     # No as_millis multiply -> the fixed-200ms util.rs backoff. Planting
     # `imul rax, rax, 1000` is what retry.rs does to a Duration base.
     assert jitter_label(bytes(blob), s) == "util.rs::backoff"
@@ -2206,6 +2325,78 @@ def _self_test_site4_deadline() -> None:
     assert find_retry_after_sites(bytes(bad), real_jitter, *maps) == []
     bad = bytearray(elf); bad[0x800] = 2  # unsupported unwind encoding cannot authorize new form
     assert find_retry_after_sites(bytes(bad), real_jitter, *maps) == []
+    _self_test_site4_fallthrough()
+
+
+def _self_test_site4_fallthrough() -> None:
+    """0.172 shared retry_delay: `jne <Some>` over a fall-through backoff."""
+    ident = lambda x: x
+    C, F, G = 0x80, 0x300, 0x500
+    jitter = [{"region_start": F + 0x20, "region_end": F + 0x40}]
+    result = bytes.fromhex("31c0 807c242000 8b542430 0f45d0 480f44442428")
+    epilogue = bytes.fromhex("4883c438 5b 415e c3")  # add rsp ; pop rbx ; pop r14 ; ret
+    # the no-fallback arm between the two returns: mov edx,-1 ; test eax,eax ;
+    # je <ret> ; mov eax,[rbx+8] ; cmp eax,-1 ; je <ret>
+    none_arm = bytes.fromhex("baffffffff 85c0 7400 8b4308 83f8ff 7400")
+
+    def build(*, long=False, got=False, cmp=b"\x83\xf8\xff"):
+        d = bytearray(b"\x90" * 0x700)
+        branch = C + len(cmp)
+        length = 6 if long else 2
+        after = branch + length
+        args = bytes.fromhex("4c89f7")                     # mov rdi,r14
+        call = after + len(args)
+        join = call + (6 if got else 5)
+        some = join + len(epilogue) + len(none_arm)
+        branch_code = (b"\x0f\x85" + struct.pack("<i", some - after)) if long else (
+            b"\x75" + struct.pack("<b", some - after))
+        call_code = (b"\xff\x15" + struct.pack("<i", G - join)) if got else (
+            b"\xe8" + struct.pack("<i", F - join))
+        code = (cmp + branch_code + args + call_code + epilogue + none_arm
+                + b"\xe8\x00\x00\x00\x00" + result + epilogue)
+        d[C:C + len(code)] = code
+        struct.pack_into("<Q", d, G, F)
+        return d, branch, length, call, some
+
+    def find(d, entries=(F,)):
+        return find_retry_after_sites(bytes(d), jitter, ident, ident,
+                                      backoff_entries=set(entries))
+
+    for case in ({}, {"long": True}, {"got": True}, {"long": True, "got": True},
+                 {"cmp": b"\x41\x83\xf9\xff"}):
+        d, branch, length, call, some = build(**case)
+        sites = find(d)
+        assert len(sites) == 1, (case, sites)
+        s = sites[0]
+        assert (s["cmp"], s["branch"], s["len"], s["call"]) == (C, branch, length, call)
+        assert s["condition"] == "jne" and s["none"] == 0xFFFF_FFFF and not s["patched"]
+        assert s["patch"] == NOP_RUNS[length]
+        done = bytearray(d)
+        done[branch:branch + length] = s["patch"]
+        again = find(done)
+        assert len(again) == 1 and again[0]["patched"] and again[0]["call"] == call
+        assert find(d, {F - 0x10}) == []  # nearby but wrong function
+        assert find_retry_after_sites(bytes(d), jitter, ident, ident) == []  # no unwind proof
+
+    d, branch, length, call, some = build()
+    bad = bytearray(d); bad[call + 5 + 3] = 0x28     # backoff arm pops another frame
+    assert find(bad) == []
+    bad = bytearray(d); bad[call + 5] = 0x90         # backoff result is not returned
+    assert find(bad) == []
+    bad = bytearray(d); bad[some + 5 + 10] ^= 1      # Some result slots disagree
+    assert find(bad) == []
+    bad = bytearray(d); bad[branch + 1] += 40        # jne lands past the Some result
+    assert find(bad) == []
+    bad = bytearray(d); bad[branch + 1] = 3          # jne lands on the call itself
+    assert find(bad) == []
+    bad = bytearray(d); bad[branch + 2:branch + 5] = b"\x48\x89\x07"  # store, not args
+    assert find(bad) == []
+    # The Some arm must stay inside the caller the unwind index reports.
+    assert _find_deadline_retry_after_sites(bytes(d), (lambda p: p == F, ident, ident),
+                                            [C, some, F, G]) == []
+    # Truncated anywhere before the Some arm's final `ret`: no match, no raise.
+    for end in range(some + 5 + len(result) + len(epilogue) - C):
+        assert find(d[:C + end]) == []
 
 
 def _self_test_site5() -> None:
@@ -2242,6 +2433,12 @@ def _self_test_site5() -> None:
     patched[at : at + len(patch)] = patch
     s2 = find_conn_delay_sites(bytes(patched))
     assert len(s2) == 1 and s2[0]["current"] == 1 and s2[0]["off"] == at, s2
+    # 0.172.0 reaches the warn! static through the GOT: `mov rax,[rip+disp32]`.
+    got_tail = tail[:-7] + b"\x48\x8b\x05" + struct.pack("<i", 0x40)
+    via_got = bytearray(b"\x00" * at + load + got_tail + ladder + b"\x00" * 0x40)
+    assert len(find_conn_delay_sites(bytes(via_got))) == 1
+    via_got[at : at + len(patch)] = patch
+    assert find_conn_delay_sites(bytes(via_got))[0]["current"] == 1
     # the load pair alone is not enough: without the paired tail it is skipped
     lone = bytearray(b"\x00" * at + load + b"\x00" * 0x40)
     assert find_conn_delay_sites(bytes(lone)) == []

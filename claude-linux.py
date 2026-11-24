@@ -8,7 +8,7 @@ claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
   5. Ignore Retry-After / ratelimit-reset so 429s also wait ~1s
   6. Pin the API retry loop's delay to 1000ms at the assignment
 
-Targets the code shapes in Claude Code 2.1.306; older versions are not
+Targets the code shapes in Claude Code 2.1.331; older versions are not
 supported. Patches the minified JS embedded in Linux/macOS binaries.
 For Windows use claude-windows.py (maintained separately).
 
@@ -268,7 +268,7 @@ def apply_site(data: bytearray, s: dict, stats: dict) -> None:
 # --- Detector 1: retry cap ----------------------------------------------------
 
 def discover_retry_cap(data: bytes) -> tuple[str, dict | None]:
-    """Disable the retry-cap guard used by Claude Code 2.1.306."""
+    """Disable the retry-cap guard used by Claude Code 2.1.331."""
     m = find_unique(
         data,
         rb'if\((?P<guard>' + _IDENT + rb'>' + _IDENT + rb'|!1 *)&&!'
@@ -296,36 +296,68 @@ def discover_retry_cap(data: bytes) -> tuple[str, dict | None]:
 
 # --- Detector 2: the API retry backoff helper --------------------------------
 
+# How far above the wrapper its base/jitter declaration may sit (other small
+# helpers are emitted between the two; 2.1.331 has ~250 bytes of them).
+BASE_DECL_WINDOW = 4096
+
+
 def discover_backoff_fn(data: bytes) -> dict | None:
-    """Match the 2.1.306 API wrapper and its adjacent base/jitter constants.
+    """Match the 2.1.331 API wrapper, then the base constant declared above it.
+
+        var BASE=500,RATIO=0.25,...;
+        function NAME(attempt, retryAfter, cap=32000, random=Math.random, base=BASE) {
+            let j = Math.round(shared({attempt, baseMs: base, capMs: cap,
+                        jitter: {kind: "proportional", ratio: RATIO}, random})),
+                ms = PARSER(retryAfter);
+            if (ms === void 0) return j;
+            let f = inScope() ? 0 : random() * RATIO;
+            return Math.max(Math.round(ms * (1 + f)), j)
+        }
 
     Bind each parameter to its use in the shared helper and Retry-After parser.
     Only this wrapper's attempt is pinned; unrelated shared-helper calls stay
     untouched. The same shape also recognizes our equal-length patched bytes.
+    PARSER is returned so the retry loop's own reads of the header can be
+    proven to go through the same function.
     """
     m = find_unique(
         data,
-        rb'(?:var|let|const) (?P<base_var>' + _IDENT + rb')=(?P<base>' + _NUMBER + rb')'
-        rb',(?P<ratio_var>' + _IDENT + rb')=' + _NUMBER + rb';'
-        rb'(?P<body>function (?P<name>' + _IDENT + rb')\((?P<attempt>' + _IDENT + rb'),'
+        rb'function (?P<name>' + _IDENT + rb')\((?P<attempt>' + _IDENT + rb'),'
         rb'(?P<retry>' + _IDENT + rb'),(?P<cap>' + _IDENT + rb')=' + _NUMBER + rb','
         rb'(?P<random>' + _IDENT + rb')=Math\.random,'
-        rb'(?P<base_arg>' + _IDENT + rb')=(?P=base_var)\)\{let (?P<jitter>' + _IDENT + rb')'
+        rb'(?P<base_arg>' + _IDENT + rb')=(?P<base_var>' + _IDENT + rb')\)\{'
+        rb'let (?P<jitter>' + _IDENT + rb')'
         rb'=Math\.round\(' + _IDENT + rb'\(\{attempt:(?P<step>(?P=attempt)|1 *)'
         rb',baseMs:(?P=base_arg),capMs:(?P=cap),'
-        rb'jitter:\{kind:"proportional",ratio:(?P=ratio_var)'
-        rb'\},random:(?P=random)\}\)\);'
-        rb'if\((?P=retry)\)\{let (?P<seconds>' + _IDENT + rb')=parseInt\((?P=retry),10\);'
-        rb'if\(!isNaN\((?P=seconds)\)\)(?P<header>return Math\.max\((?P=seconds)\*1000,'
-        rb'(?P=jitter)\)|return (?P=jitter) {2,})\}return (?P=jitter)\})',
+        rb'jitter:\{kind:"proportional",ratio:(?P<ratio_var>' + _IDENT + rb')'
+        rb'\},random:(?P=random)\}\)\),'
+        rb'(?P<ms>' + _IDENT + rb')=(?P<parser>' + _IDENT + rb')\((?P=retry)\);'
+        rb'if\((?P=ms)===void 0\)return (?P=jitter);'
+        rb'let (?P<fuzz>' + _IDENT + rb')=' + _IDENT + rb'\(\)\?0:'
+        rb'(?P=random)\(\)\*(?P=ratio_var);'
+        rb'(?P<header>return Math\.max\(Math\.round\((?P=ms)\*\(1\+(?P=fuzz)\)\),'
+        rb'(?P=jitter)\)|return (?P=jitter) {2,})\}',
         "API retry backoff helper",
     )
     if m is None:
         return None
+    # The declaration is no longer adjacent, and one-letter names recur all
+    # over the bundle, so resolve it only in the bytes just above the wrapper
+    # and only as the BASE,RATIO pair the wrapper itself refers to.
+    lo = max(0, m.start() - BASE_DECL_WINDOW)
+    decl = find_unique(
+        data[lo:m.start()],
+        _NOT_IDENT + rb'(?:var|let|const) ' + re.escape(m.group("base_var"))
+        + rb'=(?P<base>' + _NUMBER + rb'),' + re.escape(m.group("ratio_var"))
+        + rb'=' + _NUMBER + rb'(?=[,;])',
+        "API retry backoff base constant",
+    )
+    base = None if decl is None else {
+        "var": m.group("base_var"), "offset": lo + decl.start("base"),
+        "raw": decl.group("base")}
     return {
-        "name": m.group("name"), "body_start": m.start("body"),
-        "base": {"var": m.group("base_var"), "offset": m.start("base"),
-                 "raw": m.group("base")},
+        "name": m.group("name"), "body_start": m.start(),
+        "parser": m.group("parser"), "base": base,
         "attempt": {"offset": m.start("step"), "raw": m.group("step")},
         "header": {"offset": m.start("header"), "raw": m.group("header"),
                    "jitter": m.group("jitter"),
@@ -337,10 +369,14 @@ def backoff_sites(fn: dict) -> list[dict]:
     """Turn a discovered backoff helper into concrete rewrites."""
     sites = []
     base = fn["base"]
-    where = f"const {base['var'].decode()}"
-    if parse_number(base["raw"]) == TARGET_DELAY_MS:
-        sites.append(site_done("backoff_base", f"Backoff base already {TARGET_DELAY_MS}ms ({where})"))
+    if base is None:
+        pass  # find_unique() already said why; the other two sites still apply
+    elif parse_number(base["raw"]) == TARGET_DELAY_MS:
+        sites.append(site_done(
+            "backoff_base",
+            f"Backoff base already {TARGET_DELAY_MS}ms (const {base['var'].decode()})"))
     else:
+        where = f"const {base['var'].decode()}"
         new = js_number(TARGET_DELAY_MS, len(base["raw"]))
         if new is None:
             print(f"  WARN: cannot fit {TARGET_DELAY_MS} into the "
@@ -377,6 +413,13 @@ def backoff_sites(fn: dict) -> list[dict]:
 
 # --- Detector 3: pin the retry loop's delay assignments ----------------------
 
+# How far above the telemetry event the delay assignments may sit. The first
+# one is ~1500 bytes up in 2.1.331; every match must still be an assignment of
+# the telemetry's own delay variable from the backoff helper, so a generous
+# window cannot pull in an unrelated call.
+DELAY_PIN_WINDOW = 3000
+
+
 def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
     """Pin every "how long until the next attempt" assignment to 1000ms.
 
@@ -404,7 +447,7 @@ def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
     if anchor is None:
         return []
     var = anchor.group(1)
-    lo = max(0, anchor.start() - 900)
+    lo = max(0, anchor.start() - DELAY_PIN_WINDOW)
     region = data[lo:anchor.start()]
 
     # Calls include attempt sums, an injected RNG and a conditional base.
@@ -438,120 +481,164 @@ def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
     return sites
 
 
-# --- Detector 4: rate-limit fallback delays ----------------------------------
+# --- Detector 4: the retry loop's own Retry-After reads -----------------------
 
-def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]:
-    """Shorten the 2.1.306 retry loop's rate-limit fallback and minimum waits.
+def discover_retry_after_loop(data: bytes, parser: bytes | None
+                              ) -> tuple[dict | None, dict | None]:
+    """Stop the retry loop from reading Retry-After as a wait of its own.
 
-    Bind the inline threshold and fallback to the same Retry-After parser
-    result, then resolve all three constants in one unique declaration group.
-    """
-    if ms_parser_name is None:
-        return []
-    path = find_unique(
-        data,
-        rb'let (' + _IDENT + rb')=' + re.escape(ms_parser_name)
-        + rb'\((' + _IDENT + rb')\),(' + _IDENT + rb')=\1!==null&&\1<('
-        + _IDENT + rb');[\s\S]{0,600}?if\(!\3\)\{let (' + _IDENT
-        + rb')=Math\.max\(\1\?\?(' + _IDENT + rb'),(' + _IDENT + rb')\)',
-        "rate-limit retry path",
-    )
-    if path is None:
-        return []
-    variables = (path.group(4), path.group(6), path.group(7))
+        RA = err instanceof ApiError ? PARSER(header(err)) ?? null : null,
+        SHORT = RA !== null && RA < THRESHOLD;
 
-    # Short names recur in unrelated modules; resolve the constants together.
-    names = rb'(?:' + b'|'.join(re.escape(v) for v in variables) + rb')'
-    pair = names + rb'=' + _NUMBER + rb' *'
-    groups = []
-    for declaration in re.finditer(
-        _NOT_IDENT + rb'(?:var|let|const) +'
-        + pair + rb'(?:,' + pair + rb'){2}(?=;)', data
-    ):
-        entries = list(re.compile(rb'(' + names + rb')=(' + _NUMBER + rb')').finditer(
-            data, declaration.start(), declaration.end()))
-        if {m.group(1) for m in entries} == set(variables) and len(set(variables)) == 3:
-            groups.append({m.group(1): m for m in entries})
-    if len(groups) != 1:
-        print(f"  WARN: rate-limit constant declaration group: expected 1 "
-              f"structural match, found {len(groups)}; refusing to guess",
-              file=sys.stderr)
-        return []
-    declarations = groups[0]
-
-    wanted = [
-        ("rl_threshold", variables[0], RATE_LIMIT_THRESHOLD_MS,
-         "Rate-limit inline-sleep threshold"),
-        ("rl_fallback", variables[1], TARGET_DELAY_MS,
-         "Rate-limit fallback wait"),
-        ("rl_min", variables[2], TARGET_DELAY_MS,
-         "Rate-limit minimum wait"),
-    ]
-    sites = []
-    for key, var, target, label in wanted:
-        decl = declarations[var]
-        raw = decl.group(2)
-        current = parse_number(raw)
-        if current == target:
-            sites.append(site_done(key, f"{label} already {target}ms ({var.decode()})"))
-            continue
-        new = js_number(target, len(raw))
-        if new is None:
-            print(f"  WARN: cannot fit {target} into the {len(raw)}-byte "
-                  f"{var.decode()} slot", file=sys.stderr)
-            continue
-        sites.append(site(
-            key,
-            f"{label} {raw.decode()} -> {target}ms ({var.decode()})",
-            decl.start(2), raw, new))
-    return sites
-
-
-# --- Detector 5: Retry-After / ratelimit-reset parsers -----------------------
-
-def discover_retry_after_ms_parser(data: bytes) -> tuple[bytes | None, dict | None]:
-    """Stop the Retry-After header from being consumed as a sleep duration.
-
-        function NAME(err) {
-            let h = header(err);
-            if (h) { let s = parseInt(h, 10); if (!isNaN(s)) return s * 1000 }
-            return null
-        }
-
-    Forcing the `null` return sends the caller to the (now 1s) backoff path.
-    Returns (function name, site) -- the name is fed back into the rate-limit
-    detector so the two are proven to be the same code path.
+    2.1.331 inlined the old one-purpose parser function into this expression.
+    RA feeds the fast-mode inline sleep, the fast-mode cooldown and the
+    watchdog's `retry_after_too_long` give-up, so forcing it to `null` sends
+    all three down the header-less (~1s) path. Returns (loop, site); `loop`
+    names RA and THRESHOLD for the rate-limit detector, so both are proven to
+    sit on the same code path.
     """
     m = find_unique(
         data,
-        rb'function (' + _IDENT + rb')\((' + _IDENT + rb')\)\{let (' + _IDENT + rb')='
-        + _IDENT + rb'\(\2\);if\(\3\)\{let (' + _IDENT + rb')=parseInt\(\3,10\);'
-        + rb'if\(!isNaN\(\4\)\)(return \4\*1000)\}return null\}',
-        "Retry-After milliseconds parser", warn_on_zero=False,
+        _NOT_IDENT + rb'(?P<ra>' + _IDENT + rb')=(?P<err>' + _IDENT + rb') instanceof '
+        + _IDENT + rb'\?(?P<expr>(?P<parser>' + _IDENT + rb')\(' + _IDENT
+        + rb'\((?P=err)\)\)\?\?null|null {2,}):null,' + _IDENT
+        + rb'=(?P=ra)!==null&&(?P=ra)<(?P<thr>' + _IDENT + rb');',
+        "retry loop Retry-After read",
     )
-    if m is not None:
-        old = m.group(5)
-        new = fit_literal(["return null"], len(old))
-        if new is None:
-            return m.group(1), None
-        return m.group(1), site(
-            "retry_after_ms",
-            f"Ignore Retry-After in {m.group(1).decode()}() "
-            f"(return null instead of the header's seconds)",
-            m.start(5), old, new)
+    if m is None:
+        return None, None
+    loop = {"ra": m.group("ra"), "thr": m.group("thr"), "end": m.end()}
+    old = m.group("expr")
+    if m.group("parser") is None:
+        return loop, site_done(
+            "retry_after_ms", "Retry-After already ignored in the retry loop")
+    if parser is not None and m.group("parser") != parser:
+        print("  WARN: retry loop and backoff helper parse Retry-After through "
+              "different functions; refusing to guess", file=sys.stderr)
+        return loop, None
+    return loop, site(
+        "retry_after_ms",
+        f"Ignore Retry-After in the retry loop ({m.group('ra').decode()} = null "
+        f"instead of the header's milliseconds)",
+        m.start("expr"), old, fit_literal(["null"], len(old)))
 
-    done = find_unique(
+
+def discover_retry_after_giveup(data: bytes, parser: bytes | None) -> dict | None:
+    """Stop a long Retry-After from ending the retry loop outright.
+
+        let RA = PARSER(retryAfter) ?? 0;
+        if (watchdog()) delay = Math.min(delay, ceil), persistent = !0;
+        else if (RA > Math.max(LIMIT, ...)) throw ... "tengu_api_retry_after_too_long"
+
+    Up to 2.1.306 this guard compared the computed delay, so pinning the delay
+    covered it. It now re-reads the header, and a Retry-After above the limit
+    (60s here) abandons the request instead of waiting. Reading it as 0 keeps
+    the loop on the pinned 1s delay. Anchored on the telemetry event name,
+    which is a wire string rather than a minified identifier.
+    """
+    m = find_unique(
         data,
-        rb'function (' + _IDENT + rb')\((' + _IDENT + rb')\)\{let (' + _IDENT + rb')='
-        + _IDENT + rb'\(\2\);if\(\3\)\{let (' + _IDENT + rb')=parseInt\(\3,10\);'
-        + rb'if\(!isNaN\(\4\)\)return null +\}return null\}',
-        "Retry-After milliseconds parser (patched)",
+        rb'let (?P<ra>' + _IDENT + rb')=(?P<expr>(?P<parser>' + _IDENT + rb')\('
+        + _IDENT + rb'\)\?\?0|0 {2,});if\(' + _IDENT + rb'\(\)\)(?P<delay>' + _IDENT
+        + rb')=Math\.min\((?P=delay),' + _IDENT + rb'\),' + _IDENT
+        + rb'=!0;else if\((?P=ra)>Math\.max\([^;]{0,80}\)throw ' + _IDENT
+        + rb'\("tengu_api_retry_after_too_long"',
+        "Retry-After give-up guard",
     )
-    if done is not None:
-        return done.group(1), site_done(
-            "retry_after_ms", "Retry-After already ignored in the ms parser")
-    return None, None
+    if m is None:
+        return None
+    if m.group("parser") is None:
+        return site_done("retry_after_giveup",
+                         "Retry-After give-up guard already disarmed")
+    if parser is not None and m.group("parser") != parser:
+        print("  WARN: give-up guard and backoff helper parse Retry-After through "
+              "different functions; refusing to guess", file=sys.stderr)
+        return None
+    old = m.group("expr")
+    return site(
+        "retry_after_giveup",
+        "Disarm the Retry-After give-up guard (read the header as 0, so a long "
+        "Retry-After no longer aborts the retry loop)",
+        m.start("expr"), old, fit_literal(["0"], len(old)))
 
+
+# --- Detector 5: rate-limit (fast mode) delays --------------------------------
+
+# How far past the Retry-After read the cooldown computation may sit.
+COOLDOWN_WINDOW = 2000
+
+
+def discover_rate_limit(data: bytes, loop: dict | None) -> list[dict]:
+    """Shorten the 2.1.331 rate-limit path's cooldown and inline-sleep threshold.
+
+        SHORT = RA !== null && RA < THRESHOLD;
+        ...
+        let cd = Math.max(RA ?? (other ? MIN : DEFAULT), MIN),
+            kind = ... ? "overloaded" : "rate_limit";
+        cooldown(Date.now() + cd, kind)
+
+    DEFAULT (30min) is shared with unrelated fast-mode cooldowns, so the
+    constants are left alone and this one expression is replaced by a literal.
+    THRESHOLD is only read by this path; it is resolved by its declaration,
+    which must be unique because short names recur in unrelated modules.
+    """
+    if loop is None:
+        return []
+    sites = []
+
+    thr = loop["thr"]
+    decl = find_unique(
+        data,
+        rb'(?<![A-Za-z0-9_$.])' + re.escape(thr) + rb'=(' + _NUMBER + rb')(?=[,;])',
+        f"rate-limit threshold declaration ({thr.decode()})",
+    )
+    if decl is not None:
+        raw = decl.group(1)
+        label = "Rate-limit inline-sleep threshold"
+        new = js_number(RATE_LIMIT_THRESHOLD_MS, len(raw))
+        if parse_number(raw) == RATE_LIMIT_THRESHOLD_MS:
+            sites.append(site_done(
+                "rl_threshold",
+                f"{label} already {RATE_LIMIT_THRESHOLD_MS}ms ({thr.decode()})"))
+        elif new is None:
+            print(f"  WARN: cannot fit {RATE_LIMIT_THRESHOLD_MS} into the "
+                  f"{len(raw)}-byte {thr.decode()} slot", file=sys.stderr)
+        else:
+            sites.append(site(
+                "rl_threshold",
+                f"{label} {raw.decode()} -> {RATE_LIMIT_THRESHOLD_MS}ms ({thr.decode()})",
+                decl.start(1), raw, new))
+
+    lo = loop["end"]
+    cd = find_unique(
+        data[lo:lo + COOLDOWN_WINDOW],
+        rb'let (?P<cd>' + _IDENT + rb')=(?P<expr>Math\.max\(' + re.escape(loop["ra"])
+        + rb'\?\?\(' + _IDENT + rb'\?(?P<min>' + _IDENT + rb'):' + _IDENT
+        + rb'\),(?P=min)\)|' + _NUMBER + rb' {2,}),(?P<kind>' + _IDENT
+        + rb')=[^;]{0,80}\?"overloaded":"rate_limit";' + _IDENT
+        + rb'\(Date\.now\(\)\+(?P=cd),(?P=kind)\)',
+        "rate-limit cooldown",
+    )
+    if cd is not None:
+        old = cd.group("expr")
+        if not old.startswith(b"Math.max"):
+            if parse_number(old.strip()) == TARGET_DELAY_MS:
+                sites.append(site_done(
+                    "rl_cooldown", f"Rate-limit cooldown already {TARGET_DELAY_MS}ms"))
+            else:
+                print(f"  WARN: rate-limit cooldown holds an unexpected literal "
+                      f"{old.strip().decode()}; refusing to guess", file=sys.stderr)
+        else:
+            sites.append(site(
+                "rl_cooldown",
+                f"Rate-limit cooldown -> {TARGET_DELAY_MS}ms (was the header, "
+                f"else a 10-30min default)",
+                lo + cd.start("expr"), old,
+                fit_literal([str(TARGET_DELAY_MS)], len(old))))
+    return sites
+
+
+# --- Detector 6: ratelimit-reset ----------------------------------------------
 
 def discover_ratelimit_reset(data: bytes) -> dict | None:
     """Stop `anthropic-ratelimit-unified-reset` from setting the retry delay.
@@ -584,7 +671,7 @@ def discover_ratelimit_reset(data: bytes) -> dict | None:
     return None
 
 
-# --- Detector 6: the bundled Anthropic SDK -----------------------------------
+# --- Detector 7: the bundled Anthropic SDK -----------------------------------
 # The SDK is bundled from TypeScript source with its class methods intact, so
 # `retryRequest` / `calculateDefaultRetryTimeoutMillis` are real API names, not
 # minifier output -- stable anchors. Only the locals inside are minified.
@@ -704,11 +791,17 @@ def discover_all(data: bytes) -> list[dict]:
         print("  SKIP: SDK backoff not located", file=sys.stderr)
 
     print("=== Patch 4: Retry-After / ratelimit-reset ===")
-    ms_name, ms_site = discover_retry_after_ms_parser(data)
+    parser = fn["parser"] if fn is not None else None
+    loop, ms_site = discover_retry_after_loop(data, parser)
     if ms_site is not None:
         sites.append(ms_site)
     else:
-        print("  SKIP: Retry-After milliseconds parser not located", file=sys.stderr)
+        print("  SKIP: retry loop Retry-After read not located", file=sys.stderr)
+    giveup_site = discover_retry_after_giveup(data, parser)
+    if giveup_site is not None:
+        sites.append(giveup_site)
+    else:
+        print("  SKIP: Retry-After give-up guard not located", file=sys.stderr)
     reset_site = discover_ratelimit_reset(data)
     if reset_site is not None:
         sites.append(reset_site)
@@ -722,11 +815,11 @@ def discover_all(data: bytes) -> list[dict]:
               file=sys.stderr)
 
     print("=== Patch 5: Rate-limit fallback delays ===")
-    rl = discover_rate_limit(data, ms_name)
-    if len(rl) == 3:
+    rl = discover_rate_limit(data, loop)
+    if len(rl) == 2:
         sites += rl
     else:
-        print(f"  SKIP: expected 3 rate-limit constants, located {len(rl)}",
+        print(f"  SKIP: expected 2 rate-limit sites, located {len(rl)}",
               file=sys.stderr)
 
     print("=== Patch 6: Pin the retry loop's delay to 1s ===")
@@ -817,11 +910,11 @@ def print_summary(sites: list[dict]) -> None:
     print(row("General retry delay", ["backoff_base", "backoff_pow"], "Fixed ~1 second"))
     print(row("API retry loop delay", pin_keys or ["delay_pin_1"], "Pinned to 1000ms"))
     print(row("Rate-limit retry delay",
-              ["rl_fallback", "rl_min", "rl_threshold"], "Fixed ~1 second"))
+              ["rl_cooldown", "rl_threshold"], "Fixed ~1 second"))
     print(row("SDK-level retry delay", ["sdk"], "Fixed ~0.75-1 second"))
     print(row("Retry-After / reset",
-              ["retry_after_backoff", "retry_after_ms", "ratelimit_reset",
-               "sdk_ra_ms", "sdk_ra"], "ignored (always ~1s)"))
+              ["retry_after_backoff", "retry_after_ms", "retry_after_giveup",
+               "ratelimit_reset", "sdk_ra_ms", "sdk_ra"], "ignored (always ~1s)"))
     print(sep)
 
 

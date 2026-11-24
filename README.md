@@ -139,10 +139,14 @@ stream_idle_timeout_ms = 15000
 
 ### 版本适配说明（重要）
 
-脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。**codex 0.167.2** 已在本机 Linux x64 ELF 上通过自检与 `--dry-run`，站点 1-7 全部命中（未向安装的二进制写入补丁）：抖动 3 处、stream cap 3 处、Retry-After 3 处、连接阶梯 2 处、429 开关 1 处、request cap 1 处。此前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）和 **0.159.2**（Windows x64 PE，站点 1-5 全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
+脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。**codex 0.172.0** 已在本机 Linux x64 ELF 上通过自检、`--dry-run`、副本打补丁后的重复识别与启动检查（`--version`），并已写入安装的二进制，站点 1-7 全部命中：抖动 3 处、stream cap 5 处、Retry-After 25 处、连接阶梯 3 处、429 开关 1 处、request cap 1 处；未验证真实 API 重试行为。此前 **codex 0.167.2** 已在本机 Linux x64 ELF 上通过自检与 `--dry-run`，站点 1-7 全部命中（未向安装的二进制写入补丁）：抖动 3 处、stream cap 3 处、Retry-After 3 处、连接阶梯 2 处、429 开关 1 处、request cap 1 处。此前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）和 **0.159.2**（Windows x64 PE，站点 1-5 全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
 
 - 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。站点 6 在 0.162.1 Linux 上是 1 处（`HTTP 429 retryability` 小节，`movw $0x0100`）；若该节报 `NOT FOUND`，裸 429 仍会一次不重试。站点 7 也是 1 处（`request_max_retries hard cap` 小节），带 `linked: result feeds max_attempts ...`；若该节报 `NOT FOUND`，该上限保持原值，汇总明确显示 `NOT PATCHED`，不会误报已抬到 9999（本机 0.167.2 的原值为 100）。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
-- **内置自检**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接），以及 0.167.2 的内存 Option、保留标志的寄存器 MOV、拒绝覆写标志/累加器、重复识别、截断输入和未命中的汇总。
+- **内置自检**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接），以及 0.167.2 的内存 Option、保留标志的寄存器 MOV、拒绝覆写标志/累加器、重复识别、截断输入和未命中的汇总；0.172.0 新增分离映射下的抖动常量解析、站点 4 的 `jne` 直落布局和站点 5 的 GOT 尾部。
+- **v0.167.2 → v0.172.0 变了什么**：
+  1. **`.rodata` 与 `.text` 不再同一映射**：两个 PT_LOAD 的 `vaddr − offset` 分别是 0 和 0x1000。旧脚本在文件偏移空间解析 RIP 相对操作数，算出的抖动常量地址整体偏 0x1000，站点 1/2 一处都找不到（`found 0`）。现在统一经段表做 VA↔文件偏移换算。
+  2. **站点 4 多了一种布局**：共享的 `CodexErr::retry_delay` 变成 `cmp r32,-1 ; jne <Some 分支> ; <backoff 参数> ; call backoff ; ret`，backoff 成了直落分支。处理方式是把 `jne` 换成等长 NOP；判据是直落处解码出参数装载并落到 unwind 表确认的 backoff 入口、call 之后紧跟返回 epilogue、Some 分支以解码出的「剩余等待」结果加同一 epilogue 收尾。同函数里另一条 `cmp r32,-1 ; je <返回 None>`（RetryLimit，无回退）够不到 backoff 调用，不会被改。其余 24 处是 `je` 形式的请求重试单态化副本，沿用 0.164.0 的判据。
+  3. **站点 5 的尾部**：两条 store 之后的 `warn!` 等级检查从 `lea r64,[rip]` 变成经 GOT 的 `mov r64,[rip]`，两种都接受；阶梯夹取离加载点最远 0xf0e 字节，窗口从 0x1000 放到 0x2000（整个镜像只有 5 对这样的比较）。
 - **v0.167.2 的站点 7**：Option 判别改为 `cmp byte[option],0`，中间还调度了一条保存 Option 指针的寄存器 `mov`。新版检测器要求此前的配置值加载来自同一 Option 的 `+8` 字段，只允许一条不覆盖累加器、不修改标志的寄存器 MOV；实际改写仍只覆盖 `cmp/mov/cmovb` 的 13 字节，Option 判别、默认值 4 和后续代码全部保留。
 - **v0.156.1 → v0.159.1 变了什么**：两个 backoff 的结构判据没变（116 个 `from_millis` 尾部里仍恰好 2 处）。`retry.rs` 把 `Duration` 换成毫秒的 `imul * 1000` 挪到了尾部前 445 字节，超出原来的 320 字节抖动窗口，标签要单独回扫 1024 字节，否则两处都会被印成 `util.rs::backoff`。站点 4 从 2 处变成 4 处，多出来的两处 call 落在 `retry.rs::backoff` 里，验证通过就照打。
 - **v0.142.4 → v0.143.0 变了什么**（供下次排查参照）：
@@ -159,7 +163,7 @@ stream_idle_timeout_ms = 15000
 | 1/2 | 遍历**全部** `from_millis` 内联尾部（0.153.4 有 110 处），要求①之前有寄存器形式 `mulsd`②再往前有一个「抖动倍率」区间常量（`0.5 < c < 2.0` 且 `≠ 1.0`）③两者之间跨度合理。三条同时成立的恰好 2 处 | 硬编码 `0.9`、「全局只能有一个 0.9」、指令助记符 |
 | 3 | 只匹配固定中段（`cmovb` + Option 判别），**上限和 `unwrap_or` 默认值都当立即数读出** | 硬编码 `mov eax,5`、上限 100 |
 | 4 | 跟着 `call` 穿过 GOT 槽拿到函数入口，确认站点 2 改过的抖动代码落在函数体内 | 寄存器编号、`cmp/jne` 的具体编码 |
-| 5 | ①7 字节 load pair 形状②后随两条 store + RIP 相对 `lea`③同一函数内有 `.min(cap)` 的**成对** `cmp r64,cap+1` / `cmp r64,cap`（上限值读出来，不假设是 60） | 硬编码 60s、单条 `cmp`（会误命中 tracing 等级检查） |
+| 5 | ①7 字节 load pair 形状②后随两条 store + RIP 相对 `lea`（0.172.0 起为经 GOT 的 RIP 相对 `mov`，两者都接受）③同一函数内有 `.min(cap)` 的**成对** `cmp r64,cap+1` / `cmp r64,cap`（上限值读出来，不假设是 60） | 硬编码 60s、单条 `cmp`（会误命中 tracing 等级检查） |
 | 6 | ①一条 `movl $nanos,disp`（nanos 取值落在合法 Duration 区间）②同基址、位移恰为 `disp+0x08` 的 `mov r64, mem`（记下源寄存器给站点 7）③同基址、位移恰为 `disp+0x10` 的 `movw $0x0100`④紧随其后、位移为 `disp+0x12` 的 `movb $1`。四条 store 都用同一套 mem 操作数解码（disp8/disp32/REX.B），位移关系而非绝对值定案，`movw` 的高字节（retry_5xx=1）同时校验 | 硬编码 `0x98`/`0xa8` 偏移、硬编码 base_delay 200ms、硬编码寄存器 |
 | 7 | ①`cmp val,imm8` + `mov acc,imm32`（两个立即数必须相等，正值且小于 128）+ `cmovb` + Option 判别（`test opt,opt`，或 `cmp byte[option],0` 且前置 `mov val,[option+8]`）+ 可选一条保留标志且不覆盖 acc 的寄存器 MOV + `mov res,default` + `cmovne`，寄存器逐一对应②结果寄存器必须等于站点 6 字面量装载 `max_attempts` 的寄存器，已打补丁形态也必须满足③必须位于该字面量 ±0x800 范围内。②是语义链接，排除无关同形夹取 | 硬编码寄存器（r13/rax/rsi、0.167.2 的 rax/rcx/rbp）、硬编码默认 4、硬编码偏移 |
 
@@ -181,7 +185,7 @@ stream_idle_timeout_ms = 15000
 
 ## claude
 
-`claude-linux.py` 仅针对 **Claude Code 2.1.306** 的代码结构，不保留旧版兼容。Windows 脚本独立维护，本次未同步适配。
+`claude-linux.py` 仅针对 **Claude Code 2.1.331** 的代码结构，不保留旧版兼容。Windows 脚本独立维护，本次未同步适配。
 
 Linux/macOS 脚本处理以下 6 类重试逻辑：
 
@@ -190,11 +194,13 @@ Linux/macOS 脚本处理以下 6 类重试逻辑：
 | 1 | `CLAUDE_CODE_MAX_RETRIES` 读取函数 | 将环境变量夹到内部上限 | 将夹取条件改为恒假 |
 | 2 | API 退避包装函数 | 委托共享函数计算指数退避，接受自定义基础延迟 | 默认 base→1000ms、传给共享函数的 attempt→1；忽略 Retry-After |
 | 3 | SDK `calculateDefaultRetryTimeoutMillis` | `min(0.5×2^n, 8)` 秒 | 系数→1、指数底→1，约 0.75–1s |
-| 4 | `Retry-After` / `ratelimit-reset` 读取 | 服务端要求的等待优先于退避 | 忽略头值，回落到补丁后的退避 |
-| 5 | 限流长等待常量 | 30 分钟 / 10 分钟兜底 | 都改成 1s；内联睡眠阈值抬到 99999ms |
+| 4 | `Retry-After` / `ratelimit-reset` 读取 | 服务端要求的等待优先于退避；`Retry-After` 超过 60s 时直接放弃（`retry_after_too_long`） | 忽略头值，回落到补丁后的退避；放弃守卫读到的头值改为 0 |
+| 5 | 限流（fast mode）冷却 | `max(头值 ?? 30 分钟/10 分钟, 10 分钟)` | 冷却表达式就地写死 `1000`；内联睡眠阈值抬到 99999ms |
 | 6 | 重试循环里的 2 处延迟赋值 | `min(reset头 ?? 退避(...), 上限)` 或带自定义 base 的退避 | 就地写死 `=1000` |
 
 > **站点 6 不是冗余**：reset 头非空时，`??` 会短路掉退避函数；另一路调用可显式传入基础延迟。必须改赋值本身，才能避免这两条路径绕过默认 base 的补丁。
+>
+> **站点 4 的放弃守卫**：2.1.306 及之前该守卫比较的是计算出的延迟，站点 6 写死 `=1000` 后自然不触发；2.1.331 改为重新读取 `Retry-After` 头，因此需要单独一处改写才能保持「长 Retry-After 不终止重试」的原有补丁效果。30 分钟默认冷却常量被其他 fast mode 冷却共用，故站点 5 不改常量、只改这一处表达式。
 
 ### 核心规则：不改失败判定和超时
 
@@ -210,7 +216,7 @@ python3 claude-linux.py --restore     # 还原
 
 ### Windows — `claude-windows.py`
 
-Windows 脚本仍使用原有探测逻辑；不代表已经适配 2.1.306，运行前须独立检查 dry-run 结果。
+Windows 脚本仍使用原有探测逻辑；不代表已经适配 2.1.331，运行前须独立检查 dry-run 结果。
 
 ```powershell
 # 需先关闭正在运行的 claude.exe（Windows 会锁定运行中的可执行文件）
@@ -242,10 +248,10 @@ $env:BUN_JSC_forceDebuggerBytecodeGeneration="1"
 | 站点 | Linux/macOS 当前判据 |
 |---|---|
 | 1 | 唯一的夹取守卫及警告字符串；比较条件、警告和返回值必须绑定相同变量 |
-| 2 | 完整的 `Math.round(shared({attempt,baseMs,capMs,jitter,random}))` 包装函数；要求相邻 base/ratio 声明、默认 base 参数及各处引用一致。只固定这个包装函数的 attempt，不改共享函数及无关重试路径 |
+| 2 | 完整的 `Math.round(shared({attempt,baseMs,capMs,jitter,random}))` 包装函数（含其后的 `Retry-After` 解析与 `Math.max` 返回）；默认 base 参数及各处引用必须一致，base/ratio 成对声明只在函数上方 4KB 内唯一解析。只固定这个包装函数的 attempt，不改共享函数及无关重试路径 |
 | 3 | SDK 稳定方法名 `calculateDefaultRetryTimeoutMillis` |
-| 4 | 协议字符串 `retry-after` / `retry-after-ms` / `anthropic-ratelimit-unified-reset`，结合解析器变量绑定 |
-| 5 | 折叠重试循环中的阈值与兜底使用站点 4 解析出的同一变量；三个常量必须来自唯一的同组数值声明，不再回退到全局逐名查找 |
+| 4 | 协议字符串 `retry-after` / `retry-after-ms` / `anthropic-ratelimit-unified-reset`；重试循环内 `err instanceof X ? parser(header(err)) ?? null : null` 及放弃守卫（锚定遥测事件名 `tengu_api_retry_after_too_long`）使用的解析器必须与站点 2 包装函数调用的是同一个 |
+| 5 | 阈值变量与冷却表达式都绑定站点 4 读出的同一 Retry-After 变量；冷却表达式须在其后 2KB 内唯一，并以 `"overloaded":"rate_limit"` 及 `Date.now()+冷却` 调用收尾；阈值声明须全局唯一 |
 | 6 | 遥测事件 `"tengu_api_retry"` 的 `delayMs` 字段绑定延迟变量，只替换附近完整的退避赋值表达式 |
 
 安全约束：
@@ -264,7 +270,7 @@ python3 claude-linux.py           --binary /tmp/claude.test
 python3 claude-linux.py --dry-run --binary /tmp/claude.test
 ```
 
-**Claude Code 2.1.306（本机 linux-x64 ELF）**：14 处站点全部命中，零警告、零跳过；等长改写及补丁后重复识别通过。不以此声称已经验证真实 API 重试行为。
+**Claude Code 2.1.331（npm 包 linux-x64 ELF 的副本）**：14 处站点全部命中，零警告、零跳过；等长改写及补丁后重复识别通过，改写所在的 3 个 JS chunk 经 `node --check` 语法检查通过（重试循环所在 chunk 需先把 Node 22 尚不支持的 `using` 声明替换为 `let`，原始 chunk 同样处理后结果一致），补丁后二进制可正常启动（`--version` / `--help`）；随后已写入本机安装的 2.1.331，重复 dry-run 识别为 14 处已打补丁。不以此声称已经验证真实 API 重试行为。
 
 ### 参数（两版通用）
 
