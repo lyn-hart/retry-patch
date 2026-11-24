@@ -1,19 +1,18 @@
 # Retry / Backoff 补丁脚本 — 使用说明
 
-> 操作前先**退出正在运行的 codex / claude / pi**；用户 npm 目录（`~/.npm-global`）下的安装**无需 sudo**；所有脚本都支持预览（`--dry-run`）和 `--restore` 还原，打补丁前自动备份为 `<目标文件>.orig`。
+> 操作前先**退出正在运行的 codex / claude**；用户 npm 目录（`~/.npm-global`）下的安装**无需 sudo**；两个脚本都支持预览（`--dry-run`）和 `--restore` 还原，打补丁前自动备份为 `<目标文件>.orig`。
 
-每个脚本启动时会**检测当前系统环境**（`os.name`），跑错平台会直接拒绝：
+本仓库只保留 Linux / macOS（ELF / Mach-O）版本：
 
-| 工具 | Linux / macOS | Windows |
+| 工具 | 脚本 | 已验证目标 |
 |---|---|---|
-| codex | `codex-linux.py` | `codex-windows.py` |
-| claude | `claude-linux.py` | `claude-windows.py` |
-| pi | `pi-linux.py`（也支持 WSL） | 请在 WSL 内运行 Linux 版 |
+| codex | `codex-linux.py` | codex 0.172.0（Linux x64 ELF） |
+| claude | `claude-linux.py` | Claude Code 2.1.331（Linux x64 ELF） |
 
-- codex 两版处理**真实机器码差异**：Linux 走 ELF/Mach-O 文件偏移空间；Windows 走 PE 的 VA 换算（`build_pe_off2va` / `build_pe_maps`）。两版都支持 `addsd` / `movsd [0.9]` 双锚点。
-- claude 两版补丁本体（内嵌 JS 文本）**逐字节相同**，差异仅在二进制发现、写文件、命令提示。
+两个脚本启动时都会**检测当前系统环境**（`os.name`），在 Windows 上直接拒绝运行；Windows 版脚本已移除，如仍需要请在 WSL 内使用这里的 Linux 版。
+
 - 两边都遵循同一条定位原则：**能用语义就不用字节串**，判据必须多条件同时成立，且可以在 `--dry-run` 里打印出来供人核对。
-- **pi 是不同用途**：将已失败的模型响应归为可重试，但预算池配额耗尽除外；不改变等待参数，详见 [pi](#pi)。codex / claude 的原有行为不变。
+- codex 补丁处理的是**真实机器码**（ELF/Mach-O 的 `vaddr − offset` 段映射）；claude 补丁处理的是二进制内嵌的**压缩 JS 文本**。两者互不影响。
 
 ---
 
@@ -97,23 +96,9 @@ python3 codex-linux.py
 python3 codex-linux.py --restore
 ```
 
-### Windows — `codex-windows.py`
-
-```powershell
-py codex-windows.py --dry-run    # 预览
-py codex-windows.py              # 打补丁
-py codex-windows.py --restore    # 还原
-```
-
-> 已在 **codex 0.159.2** 的 Windows x64 PE 上对过 `--dry-run`。和 Linux 0.159.1 的段数不一样，这是 MSVC 的正常结果，不是漏匹配：抖动 3 处（`retry.rs` 1 处 + `util.rs` 形状 2 处）、站点 4 共 9 处（3 处进 `util.rs::backoff`，6 处进 `retry.rs::backoff`）、站点 5 共 3 处。站点 5 在 PE 里不是 ELF 那种 7 字节 `disp8 +0x10/+0x18`，而是 14 字节的 `disp32` 加载（秒进 `rdx`、纳秒进 `r8d`，再 `lea r9,[rip]` 调 sleep）。
-
 > 重试间隔与两个上限已固定为脚本内常量 `RETRY_MS = 1000`(毫秒)、
 > `STREAM_MAX_RETRIES = 9999`、`REQUEST_MAX_RETRIES = 9999`，**不提供
 > `--ms` / `--max-retries` 命令行参数**；如需改值，直接编辑脚本顶部这三个常量。
-
-> **站点 6/7（翻转 `retry_429`、抬高 request cap）目前只在 `codex-linux.py` 里实现。**
-> 这一版的 `codex-windows.py` 仍是 5 处；在 Windows 上碰到裸 429 也会一次不重试，
-> 而且 `request_max_retries` 仍卡在 100。PE 的两处站点编码与 ELF 不同，需要单独适配。
 
 实际重试**次数**仍由 `config.toml` 决定（脚本只抬高上限，不填就还是默认的 `stream_max_retries = 5` / `request_max_retries = 4`）：
 
@@ -128,20 +113,20 @@ request_max_retries = 50
 stream_idle_timeout_ms = 15000
 ```
 
-### 参数（两版通用）
+### 参数（codex）
 
 | 参数 | 说明 |
 |---|---|
 | `--dry-run` | 只检查打印，不写入、不备份 |
 | `--restore` | 从 `.orig` 还原 |
-| `--binary <路径>` | 手动指定原生 `codex` / `codex.exe` 二进制 |
+| `--binary <路径>` | 手动指定原生 `codex` 二进制 |
 | `--self-test` | 内部自检 |
 
 ### 版本适配说明（重要）
 
-脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。**codex 0.172.0** 已在本机 Linux x64 ELF 上通过自检、`--dry-run`、副本打补丁后的重复识别与启动检查（`--version`），并已写入安装的二进制，站点 1-7 全部命中：抖动 3 处、stream cap 5 处、Retry-After 25 处、连接阶梯 3 处、429 开关 1 处、request cap 1 处；未验证真实 API 重试行为。此前 **codex 0.167.2** 已在本机 Linux x64 ELF 上通过自检与 `--dry-run`，站点 1-7 全部命中（未向安装的二进制写入补丁）：抖动 3 处、stream cap 3 处、Retry-After 3 处、连接阶梯 2 处、429 开关 1 处、request cap 1 处。此前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）和 **0.159.2**（Windows x64 PE，站点 1-5 全部命中；段数见上面 Windows 小节）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过。
+脚本靠识别二进制里特定的机器码模式来打补丁，**codex 升级后模式可能失效**。**codex 0.172.0** 已在本机 Linux x64 ELF 上通过自检、`--dry-run`、副本打补丁后的重复识别与启动检查（`--version`），并已写入安装的二进制，站点 1-7 全部命中：抖动 3 处、stream cap 5 处、Retry-After 25 处、连接阶梯 3 处、429 开关 1 处、request cap 1 处；未验证真实 API 重试行为。此前 **codex 0.167.2** 已在本机 Linux x64 ELF 上通过自检与 `--dry-run`，站点 1-7 全部命中（未向安装的二进制写入补丁）：抖动 3 处、stream cap 3 处、Retry-After 3 处、连接阶梯 2 处、429 开关 1 处、request cap 1 处。此前已验证 **codex 0.162.1**（Linux x64 ELF，站点 1-7 全部命中）、**0.159.1**（Linux x64 ELF，站点 1-5 全部命中）。更早的 **v0.156.1 / v0.153.4**（Linux x64 ELF）以及 **v0.143.0 / v0.144.1**（Linux x64 ELF 与 Windows x64 PE 的站点 1-3）也适配过；Windows 版脚本（含 0.159.2 PE 上的站点 1-5 验证）已从仓库移除，下面保留的 PE 细节仅作历史参照。
 
-- 每次 codex 升级后，先跑对应平台的 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出；Windows 0.159.2 上 `util.rs` 有两处，多出来的那处照打）。站点 5 在 Linux 0.159.1 上是 2 处，在 Windows 0.159.2 上是 3 处。0.159.1 Linux 上站点 4 是 4 处，0.159.2 Windows 上是 9 处，都要带 `verified: call ... lands in a patched ...backoff`。站点 6 在 0.162.1 Linux 上是 1 处（`HTTP 429 retryability` 小节，`movw $0x0100`）；若该节报 `NOT FOUND`，裸 429 仍会一次不重试。站点 7 也是 1 处（`request_max_retries hard cap` 小节），带 `linked: result feeds max_attempts ...`；若该节报 `NOT FOUND`，该上限保持原值，汇总明确显示 `NOT PATCHED`，不会误报已抬到 9999（本机 0.167.2 的原值为 100）。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
+- 每次 codex 升级后，先跑 `--dry-run`：站点 1/2 必须同时列出 `retry.rs::backoff` 和 `util.rs::backoff`（缺一个脚本会直接退出）。站点 5 在 Linux 0.172.0 上是 3 处；站点 4 是 25 处，都要带 `verified: call ... lands in a patched ...backoff`。站点 6 是 1 处（`HTTP 429 retryability` 小节，`movw $0x0100`）；若该节报 `NOT FOUND`，裸 429 仍会一次不重试。站点 7 也是 1 处（`request_max_retries hard cap` 小节），带 `linked: result feeds max_attempts ...`；若该节报 `NOT FOUND`，该上限保持原值，汇总明确显示 `NOT PATCHED`，不会误报已抬到 9999。若报错（如 `expected at least 2 jittered backoff sites` 或 `expected both retry.rs::backoff and util.rs::backoff`）说明字节码又变了，需要重新适配。
 - **内置自检**：`python3 codex-linux.py --self-test` 覆盖站点 6/7 的纯字节用例（disp8/disp32/REX.B、四条 store 缺一不可、站点 6→7 的寄存器链接），以及 0.167.2 的内存 Option、保留标志的寄存器 MOV、拒绝覆写标志/累加器、重复识别、截断输入和未命中的汇总；0.172.0 新增分离映射下的抖动常量解析、站点 4 的 `jne` 直落布局和站点 5 的 GOT 尾部。
 - **v0.167.2 → v0.172.0 变了什么**：
   1. **`.rodata` 与 `.text` 不再同一映射**：两个 PT_LOAD 的 `vaddr − offset` 分别是 0 和 0x1000。旧脚本在文件偏移空间解析 RIP 相对操作数，算出的抖动常量地址整体偏 0x1000，站点 1/2 一处都找不到（`found 0`）。现在统一经段表做 VA↔文件偏移换算。
@@ -176,16 +161,18 @@ stream_idle_timeout_ms = 15000
   - 站点 6 锚在 `movw $0x0100` 上：`rustc` 把 `ApiRetryConfig` 字段重排为「`base_delay`(16B) → `max_attempts`(8B) → `retry_429`/`retry_5xx`/`retry_transport`」，所以字面量编译成「nanos 的 `movl` → max_attempts 的 `mov r64` → 打包二布尔的 `movw` → transport 的 `movb`」。四条 store 都要在，判据只用**相对位移**（max_attempts = nanos + 0x08，布尔 = +0x10，transport = +0x12），不写死 0x98/0xa8；并用 `Duration::nanos ≤ 999_999_999` 把无关 nanosecond 运算筛掉。max_attempts 的源寄存器留给站点 7。0.162.1 上恰好 1 处，多了就拒绝。
   - 站点 7 用**寄存器链接**定位：`request_max_retries()` 的 `.min(100)` 与站点 6 同在 `to_api_provider`，其相位就是站点 6 字面量装载 `max_attempts` 的那个寄存器。二进制里同形的 `min`+`unwrap_or` 有 11 处（大多是无关的 `unwrap_or(1).min(...)`），只有这一处的结果寄存器与该字面量一致。改写是把整段 13/14 字节的 `cmp/mov/cmovb` 换成真正的 `.min(9999)`（`cmp imm8` 装不下 9999，只能整体改写）。
 
-#### Linux 与 Windows 拆分要点
+#### 平台相关的实现细节（历史参照）
 
-- **RIP 相对寻址必须在虚拟地址(VA)空间解析**。Linux 版对整文件单一映射的 ELF/Mach-O 直接用文件偏移做 `i+plen+5+disp == c09` 比较即可；Windows 版必须走 `build_pe_off2va()` 换算到 VA 再比较，因为 PE 的 `.text` 与 `.rdata` 的 `VA − 文件偏移` 增量不同（`FileAlignment 0x200 ≠ SectionAlignment 0x1000`）。
-- **MSVC 把毫秒值分配进扩展寄存器 `r8`/`r9`**：`from_millis` 尾部是 `4c 89 c0`（REX.W+REX.R 的 `mov rax,r8`）而非 musl 的 `48 89`。两版尾部识别都同时接受 `48`/`4c`，补丁对 `r8–r15` 加 `41`(REX.B)前缀写出 `41 b8 <imm32>`。
+当前脚本只处理 Linux / macOS。Windows PE 版脚本已移除，以下两条记录当时 PE 与 ELF 的编码差异，供将来重新适配时参考：
+
+- **RIP 相对寻址必须在虚拟地址(VA)空间解析**。Linux 版按段表做 VA↔文件偏移换算（0.172.0 起 `.rodata` 与 `.text` 的 `vaddr − offset` 分别是 0 和 0x1000，不能直接用文件偏移比较）；Windows 版则需走 `build_pe_off2va()` 换算到 VA，因为 PE 的 `.text` 与 `.rdata` 的 `VA − 文件偏移` 增量不同（`FileAlignment 0x200 ≠ SectionAlignment 0x1000`）。
+- **MSVC 把毫秒值分配进扩展寄存器 `r8`/`r9`**：`from_millis` 尾部是 `4c 89 c0`（REX.W+REX.R 的 `mov rax,r8`）而非 musl 的 `48 89`。识别时需同时接受 `48`/`4c`，补丁对 `r8–r15` 需加 `41`(REX.B) 前缀写出 `41 b8 <imm32>`。
 
 ---
 
 ## claude
 
-`claude-linux.py` 仅针对 **Claude Code 2.1.331** 的代码结构，不保留旧版兼容。Windows 脚本独立维护，本次未同步适配。
+`claude-linux.py` 仅针对 **Claude Code 2.1.331** 的代码结构，不保留旧版兼容。
 
 Linux/macOS 脚本处理以下 6 类重试逻辑：
 
@@ -214,29 +201,12 @@ python3 claude-linux.py               # 打补丁
 python3 claude-linux.py --restore     # 还原
 ```
 
-### Windows — `claude-windows.py`
-
-Windows 脚本仍使用原有探测逻辑；不代表已经适配 2.1.331，运行前须独立检查 dry-run 结果。
-
-```powershell
-# 需先关闭正在运行的 claude.exe（Windows 会锁定运行中的可执行文件）
-py claude-windows.py --dry-run
-py claude-windows.py
-py claude-windows.py --restore
-```
-
 打补丁后设置环境变量再运行 claude（脚本不会自动修改 shell 配置）：
 
 ```bash
-export CLAUDE_CODE_MAX_RETRIES=9999            # Linux / macOS
+export CLAUDE_CODE_MAX_RETRIES=9999            # 重试次数上限（站点 1 已解除内部夹取）
 export CLAUDE_CODE_RETRY_WATCHDOG=1            # 429/过载持续重试，并解除 15 次上限
 export BUN_JSC_forceDebuggerBytecodeGeneration=1 # 让 standalone Bun 使用已修改的源码
-```
-
-```powershell
-$env:CLAUDE_CODE_MAX_RETRIES="9999"            # Windows
-$env:CLAUDE_CODE_RETRY_WATCHDOG="1"
-$env:BUN_JSC_forceDebuggerBytecodeGeneration="1"
 ```
 
 > npm 包入口 `bin/claude.exe` 在本机 Linux 上是 ELF 二进制，扩展名不代表格式。写入使用同目录临时文件原子替换，保留原所有者与权限；正在运行的会话仍使用旧二进制，需要重启才生效。
@@ -245,7 +215,7 @@ $env:BUN_JSC_forceDebuggerBytecodeGeneration="1"
 
 补丁修改二进制内嵌的压缩 JS 文本。名字和数值从结构匹配结果中读取，不写死压缩标识符：
 
-| 站点 | Linux/macOS 当前判据 |
+| 站点 | 当前判据 |
 |---|---|
 | 1 | 唯一的夹取守卫及警告字符串；比较条件、警告和返回值必须绑定相同变量 |
 | 2 | 完整的 `Math.round(shared({attempt,baseMs,capMs,jitter,random}))` 包装函数（含其后的 `Retry-After` 解析与 `Math.max` 返回）；默认 base 参数及各处引用必须一致，base/ratio 成对声明只在函数上方 4KB 内唯一解析。只固定这个包装函数的 attempt，不改共享函数及无关重试路径 |
@@ -272,71 +242,32 @@ python3 claude-linux.py --dry-run --binary /tmp/claude.test
 
 **Claude Code 2.1.331（npm 包 linux-x64 ELF 的副本）**：14 处站点全部命中，零警告、零跳过；等长改写及补丁后重复识别通过，改写所在的 3 个 JS chunk 经 `node --check` 语法检查通过（重试循环所在 chunk 需先把 Node 22 尚不支持的 `using` 声明替换为 `let`，原始 chunk 同样处理后结果一致），补丁后二进制可正常启动（`--version` / `--help`）；随后已写入本机安装的 2.1.331，重复 dry-run 识别为 14 处已打补丁。不以此声称已经验证真实 API 重试行为。
 
-### 参数（两版通用）
+### 参数（claude）
 
 | 参数 | 说明 |
 |---|---|
 | `--dry-run` | 显示改写前后，不修改二进制，也不创建备份 |
 | `--restore` | 从 `.orig` 备份还原 |
-| `--binary <路径>` | 手动指定 `claude` / `claude.exe` 二进制 |
+| `--binary <路径>` | 手动指定 `claude` 二进制 |
 
 升级后先跑 `--dry-run`：确认探测阶段没有 `WARN` / `SKIP`，且预期站点全部命中，不能只看最后的 `Patches skipped`。上游结构变化时需重新适配；本次未验证其他版本或 macOS 构建。
 
 ---
 
-## pi
-
-`pi-linux.py` 针对 npm 包 **`@earendil-works/pi-coding-agent` 的打包版 CLI**，已在 **1.0.3** 和本机托管安装的 **1.2.0** 上验证。仅依赖 Python 3.10+ 标准库及 pi 已需安装的 Node.js；不支持独立二进制，也不修改未打包的 SDK 文件。
-
-### 作用范围：已失败的模型响应可重试，预算池配额耗尽除外
-
-- 把 `isRetryableAssistantError()` 改为判断 `stopReason === "error"`，但错误文本含 `Budget pool quota has been exhausted` 时不重试（忽略大小写，兼容换行）。不限定会话、域名或 HTTP 状态码；其他错误仍重试，包括空错误文本和其他 402 错误。
-- 同时移除 `AgentSession._isRetryableError()` 的上下文超限豁免，避免外层提前跳过重试。**上下文超限会先耗尽重试次数，再进入原有压缩恢复流程**，可能只是在重复必败的请求。
-- 除上述预算池配额耗尽外，鉴权失败、余额不足、模型不可用等都重试；**主动取消（`aborted`）和成功响应不重试**。不会把工具执行失败、启动配置错误等变成模型重试，也不修改失败判定、超时或 provider 内层重试策略。
-- **不是无限重试**：仍遵守 `retry.enabled`、`retry.maxRetries`、`retry.baseDelayMs`、`retry.maxAgentDelayMs`；脚本不修改 `settings.json`。例如现有 `maxRetries: 99`、`baseDelayMs: 1000`、`maxAgentDelayMs: 1000` 表示每次模型调用失败后最多额外重试 99 次，每次等待 1 秒。
-
-> 此模式是主动放宽错误分类：永久性错误也会消耗全部次数，可能增加费用或触发限流。需要时可在 pi 中取消；恢复默认分类用 `--restore`。
-
-### 用法（在 WSL / Linux / macOS 终端执行）
-
-```bash
-cd /home/ubuntu/workspace/retry-patch
-python3 pi-linux.py --dry-run              # 预览，不写文件、不生成备份
-python3 pi-linux.py                        # 关闭 pi 后应用补丁
-python3 pi-linux.py --restore --dry-run    # 预览恢复
-python3 pi-linux.py --restore             # 从匹配的 .orig 恢复
-
-# PATH 中找不到 pi 时，指定 npm 包目录（不是 cli.js 或 chunk 文件）
-python3 pi-linux.py --package ~/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent --dry-run
-```
-
-自动从 PATH 中的 `pi` 解析安装目录，兼容 npm 链接及托管安装的 `install/current-version` 启动器；按两处函数定义发现实际 bundle，支持两处函数位于同一或不同 chunk，**不硬编码版本号或 chunk 哈希名**。两处函数在所有候选 chunk 中均须唯一且符合已知代码结构；全部目标及其备份、Node.js 语法检查通过后才允许写入，不匹配或歧义时拒绝修改任何目标。`--dry-run` 只做静态检查，不启动 pi、不恢复会话、不发送 API 请求。
-
-每个命中 bundle 都备份到旁边的 `<chunk>.js.orig`，全部备份创建后逐文件使用同目录临时文件原子替换并保留权限（多文件写入不是整体事务）。重复运行不会覆盖原始备份；旧版「全部错误重试」补丁可直接升级或恢复。校验备份时仅将已知的新旧重试函数体归一化，其余内容必须完全匹配。pi 升级后需重新预览并应用；如果旧 `.orig` 与新安装不匹配，脚本拒绝覆盖或跨版本恢复，核实后将旧备份移走再运行。
-
-修改后重新启动 pi；无需重建或重新创建会话：
-
-```bash
-pi --session 01a10490-5593-70c4-812b-9ba8fa3840c7
-```
-
----
-
 ## 打坏了怎么恢复
 
-打补丁前脚本会自动把原始二进制备份为 `<binary>.orig`，按从易到难三选一（用你平台对应的脚本名）：
+打补丁前脚本会自动把原始二进制备份为 `<binary>.orig`，按从易到难三选一：
 
 ```bash
 # 1. 一键还原（推荐，靠 .orig 备份）
 python3 codex-linux.py --restore
 python3 claude-linux.py --restore
-python3 pi-linux.py --restore
 
 # 2. 手动从 .orig 拷回（脚本本身跑不了时）
 cp <binary>.orig <binary> && chmod 755 <binary>
 
 # 3. 重装（保底，.orig 也没了时；配置不受影响）
-npm install -g @openai/codex@0.144.1                # codex（用户 npm 目录，锁定已验证版本）
+npm install -g @openai/codex@0.172.0                # codex（用户 npm 目录，脚本已验证的版本）
 npm install -g @anthropic-ai/claude-code            # claude（用户 npm 目录）
 ```
 
